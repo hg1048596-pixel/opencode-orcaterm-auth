@@ -4,7 +4,7 @@
   "icon": "https://raw.githubusercontent.com/hg1048596-pixel/opencode-orcaterm-auth/main/icon.png",
   "providers": ["orcaterm"],
   "summary": {
-    "en": "Use your Tencent Cloud OrcaTerm AI quota (1000 questions/month) as an OpenAI-compatible provider.",
-    "zh": "把腾讯云 OrcaTerm（遨驰终端）的 AI 问答额度（每月 1000 次）当作 OpenAI 兼容供应商使用。"
+    "en": "Tencent Cloud OrcaTerm (遨驰终端) AI quota — 1000 questions a month across DeepSeek, Hunyuan, GLM and Kimi — as an OpenAI-compatible provider. Unofficial.",
+    "zh": "把腾讯云 OrcaTerm（遨驰终端）的 AI 问答额度——每月 1000 次，覆盖 DeepSeek、混元、GLM、Kimi——反代成 OpenAI 兼容供应商。非官方。"
   }
 }
