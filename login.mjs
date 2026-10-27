@@ -22,6 +22,7 @@
  *   node login.mjs --show-profile  # 打印 profile 路径
  */
 import { spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import { mkdtempSync, rmSync, existsSync, mkdirSync } from "node:fs"
 import { tmpdir, homedir } from "node:os"
 import { join } from "node:path"
@@ -270,9 +271,10 @@ function csrfCode(skey) {
 
 async function verify(ticket) {
   const body = {
-    conversationId: `cid-verify-${Date.now()}`,
+    conversationId: `cid-${randomUUID()}-orcaterm`,
     user: { id: ticket.uin, setting: { model: "deepseek-chat-latest" } },
-    input: { id: `v-${Date.now()}`, content: "ping", files: [], historyMessages: [] },
+    // input.id 要是网页端那个 uuid v4 的形状，否则上游回 Invalid inputId
+    input: { id: randomUUID(), content: "ping", files: [], historyMessages: [] },
     stream: true,
   }
   let res

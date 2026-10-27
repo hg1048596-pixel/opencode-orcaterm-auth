@@ -18,7 +18,7 @@
 import { readFileSync, existsSync, copyFileSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir, homedir } from "node:os"
 import { join } from "node:path"
-import { createDecipheriv, createHash } from "node:crypto"
+import { createDecipheriv, createHash, randomUUID } from "node:crypto"
 import { execFileSync } from "node:child_process"
 
 const JSON_OUT = process.argv.includes("--json")
@@ -42,9 +42,10 @@ function csrfCode(skey) {
 
 async function verify(ticket) {
   const body = {
-    conversationId: `cid-imp-${Date.now()}`,
+    conversationId: `cid-${randomUUID()}-orcaterm`,
     user: { id: ticket.uin, setting: { model: "deepseek-chat-latest" } },
-    input: { id: `i-${Date.now()}`, content: "ping", files: [], historyMessages: [] },
+    // input.id 要是网页端那个 uuid v4 的形状，否则上游回 Invalid inputId
+    input: { id: randomUUID(), content: "ping", files: [], historyMessages: [] },
     stream: true,
   }
   let res

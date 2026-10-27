@@ -20,6 +20,10 @@ import assert from "node:assert/strict"
 import http from "node:http"
 import pluginDefault, { _internal } from "../index.mjs"
 
+// The suite fires far more than the account's ten-a-minute budget; lift the
+// pacer so these tests measure the plugin, not the limiter.
+process.env.ORCATERM_NO_PACE = "1"
+
 const OrcaTermAuthPlugin = pluginDefault.server
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -162,6 +166,28 @@ async function askText(body, opts) {
   const res = await ask(body, opts)
   const text = await res.text()
   return { res, ...frames(text) }
+}
+
+/**
+ * 同上，但容忍「流以错误结束」：中断与上游失败都会让这条流 error，
+ * 直接 res.text() 会抛异常。返回 {out, text, err}，err 为空表示正常收尾。
+ */
+async function askTextSafe(body, opts) {
+  const res = await ask(body, opts)
+  const reader = res.body.getReader()
+  const dec = new TextDecoder()
+  let text = ""
+  let err = null
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      text += dec.decode(value, { stream: true })
+    }
+  } catch (e) {
+    err = e
+  }
+  return { res, text, err, ...frames(text) }
 }
 
 const SIMPLE = { model: "kimi", stream: true, messages: [{ role: "user", content: "hi" }] }
@@ -318,31 +344,35 @@ await ok("C1 上游完全不发 [DONE] 就关流 → 客户端仍收到 finish_r
   assert.equal(doneSeen, true, "缺少 [DONE]")
 })
 
-await ok("C2 data: [ERROR]:xxx → 翻译成可读错误帧，不挂死", async () => {
+await ok("C2 data: [ERROR]:xxx → 以错误结束这条流（不挂死、不当正文）", async () => {
   handler = (req, res) => {
     sseHead(res)
     res.end("data: [ERROR]:模型额度已用尽\n\n")
   }
-  const { out, doneSeen } = await askText(SIMPLE)
-  assert.ok(contentOf(out).includes("模型额度已用尽"), `错误文本没透出：${JSON.stringify(contentOf(out))}`)
-  assert.ok(contentOf(out).includes("OrcaTerm"), "错误帧应带来源标记")
-  assert.equal(
-    finishes(out).length,
-    1,
-    `一次流里出现了 ${finishes(out).length} 个 finish_reason 帧（应恰好 1 个）：${JSON.stringify(finishes(out))}；` +
-      `错误帧自带 finish_reason:"stop" 之后 finishUp 又补了一帧`,
+  // 设计：上游把失败写在 200 的流里，若当成正文，magpie 会记为成功 ——
+  // 既不切换账号也不让该账号休息。所以流一开始就是错误帧时，直接以错误结束。
+  const res = await ask(SIMPLE)
+  assert.notEqual(res.status, 200, `错误帧不该以 200 收场：${res.status}`)
+  const j = await res.json()
+  assert.ok(
+    JSON.stringify(j).includes("模型额度已用尽"),
+    `上游的错误原因没透出：${JSON.stringify(j)}`,
   )
-  assert.equal(doneSeen, true)
+  assert.ok(j.error?.message?.includes("OrcaTerm"), "错误信息应带来源标记")
 })
 
-await ok("C3 data: [ERROR]（无冒号）→ 也要给可读错误", async () => {
+await ok("C3 data: [ERROR]（无冒号）→ 也要给出错误，且不空", async () => {
   handler = (req, res) => {
     sseHead(res)
     res.end("data: [ERROR]\n\n")
   }
-  const { out, doneSeen } = await askText(SIMPLE)
-  assert.ok(contentOf(out).trim().length > 0, `空错误文本：${JSON.stringify(contentOf(out))}`)
-  assert.equal(doneSeen, true)
+  const res = await ask(SIMPLE)
+  assert.notEqual(res.status, 200, `错误帧不该以 200 收场：${res.status}`)
+  const j = await res.json()
+  assert.ok(
+    String(j.error?.message ?? "").trim().length > 0,
+    `空错误文本：${JSON.stringify(j)}`,
+  )
 })
 
 await ok("C4 data: [ABORTED] → 当正常收尾，不当错误、不挂死", async () => {
@@ -391,14 +421,17 @@ await ok("D1b 对照：只发 reasoning、且不发 [DONE] → 兜底生效（�
   )
 })
 
-await ok("D9 include_usage + 只有 reasoning（带 [DONE]）→ 仍要发 usage 帧", async () => {
+await ok("D9 include_usage + 只有 reasoning（带 [DONE]）→ 不发伪造 usage 帧", async () => {
   handler = (req, res) => {
     sseHead(res)
     res.write(dataLine({ reasoningContent: "想了" }))
     res.end("data: [DONE]\n\n")
   }
   const { out } = await askText({ ...SIMPLE, stream_options: { include_usage: true } })
-  assert.ok(out.some((c) => c?.usage), "include_usage 时没发 usage 帧")
+  // 上游不返回 token 数，字符数只是估算；当真实 usage 报上去会让费用与上下文统计失真
+  assert.ok(!out.some((c) => c?.usage), "不应伪造 usage 帧")
+  // 而且思考内容仍要兜底成正文，不能给出空回复
+  assert.ok(contentOf(out).trim().length > 0, "只有思考时应兜底成正文")
 })
 
 await ok("D2 非流式：上游只发 reasoning → message.content 不能为空", async () => {
@@ -530,14 +563,24 @@ await ok("E1 init.signal 中途 abort → 不挂死、无未捕获异常、上�
 
   const dec = new TextDecoder()
   let text = ""
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    text += dec.decode(value, { stream: true })
+  let readErr = null
+  // 中断后这条流会以错误结束，读取时抛异常是预期行为
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      text += dec.decode(value, { stream: true })
+    }
+  } catch (e) {
+    readErr = e
   }
   const f = frames(text)
-  assert.equal(f.doneSeen, true, `abort 后客户端应仍收到 [DONE]，实际尾部=${JSON.stringify(text.slice(-120))}`)
-  assert.ok(text.includes("连接中断"), `应给出可读的中断帧，实际尾部=${JSON.stringify(text.slice(-120))}`)
+  // 设计：中断必须以错误结束这条流，不能伪装成正常收尾 —— 否则 magpie 记成成功，
+  // 既不切换账号也不让该账号休息。所以这里不再要求 [DONE] 与「连接中断」正文帧。
+  assert.ok(
+    readErr || f.doneSeen === false,
+    `abort 后应体现出中断（流以错误结束），实际尾部=${JSON.stringify(text.slice(-120))}`,
+  )
   await sleep(150)
   assert.equal(
     rejections.length,
@@ -593,10 +636,10 @@ await ok("F1 body 是 Uint8Array（magpie 文档：body 可能是字节）→ �
   await res.text()
   const up = JSON.parse(requests.at(-1).body)
   assert.ok(
-    up.input.content.includes("字节体里的问题"),
-    `Uint8Array body 被当成 "{}" 解析丢弃：上游收到 input.content=${JSON.stringify(up.input.content)}，model=${JSON.stringify(up.user.setting.model)}`,
+    up.input.input.includes("字节体里的问题"),
+    `Uint8Array body 被当成 "{}" 解析丢弃：上游收到 input.content=${JSON.stringify(up.input.input)}，model=${JSON.stringify(up.user.setting.model)}`,
   )
-  assert.equal(up.user.setting.model, "kimi-k2", "model 也应从字节体里解析出来")
+  assert.equal(up.user.setting.model, "TokenHub/kimi-k3", "model 也应从字节体里解析出来")
 })
 
 await ok("F2 非法 JSON 字符串 body → 400（不崩）", async () => {
@@ -619,7 +662,7 @@ await ok("F3 messages: [] → 不能给上游发空 input.content", async () => 
   await res.text()
   const up = JSON.parse(requests.at(-1).body)
   assert.ok(
-    up.input.content.trim().length > 0,
+    up.input.input.trim().length > 0,
     `messages:[] 时 input.content 为空串，上游大概率报错或答非所问：${JSON.stringify(up.input)}`,
   )
 })
@@ -632,7 +675,7 @@ await ok("F4 messages 里 content 是 null/数字 → 不能给上游发空 inpu
   const res = await ask({ model: "kimi", stream: true, messages: [{ role: "user", content: null }] })
   await res.text()
   const up = JSON.parse(requests.at(-1).body)
-  assert.ok(up.input.content.trim().length > 0, `content:null 时 input.content 为空串：${JSON.stringify(up.input.content)}`)
+  assert.ok(up.input.input.trim().length > 0, `content:null 时 input.content 为空串：${JSON.stringify(up.input.input)}`)
 })
 
 await ok("F5 只有 system → input 非空、history 为空（不崩）", async () => {
@@ -643,7 +686,7 @@ await ok("F5 只有 system → input 非空、history 为空（不崩）", async
   const res = await ask({ model: "kimi", stream: true, messages: [{ role: "system", content: "你是助手" }] })
   await res.text()
   const up = JSON.parse(requests.at(-1).body)
-  assert.ok(up.input.content.includes("你是助手"))
+  assert.ok(up.input.input.includes("你是助手"))
   assert.equal(up.input.historyMessages.length, 0)
 })
 
@@ -662,9 +705,10 @@ await ok("F6 最后一条是 assistant → 不能把 assistant 内容当成自�
   })
   await res.text()
   const up = JSON.parse(requests.at(-1).body)
-  assert.equal(up.input.content, "问题一", `末条 assistant 时 input 选错：${JSON.stringify(up.input.content)}`)
-  assert.equal(up.input.historyMessages.length, 1)
-  assert.equal(up.input.historyMessages[0].role, "assistant")
+  assert.equal(up.input.input, "问题一", `末条 assistant 时 input 选错：${JSON.stringify(up.input.input)}`)
+  // 历史不再随请求上传：会话登记后上下文由服务端按 conversationId 维护。
+  // 末条 assistant 的内容不能当成用户问题，这一点由上面 input 的取值保证。
+  assert.equal(up.input.historyMessages.length, 0)
 })
 
 await ok("F7 messages 不是数组（字符串）→ 不崩，仍是合法请求", async () => {
@@ -676,7 +720,7 @@ await ok("F7 messages 不是数组（字符串）→ 不崩，仍是合法请求
   assert.equal(res.status, 200)
   await res.text()
   const up = JSON.parse(requests.at(-1).body)
-  assert.equal(typeof up.input.content, "string")
+  assert.equal(typeof up.input.input, "string")
   assert.ok(Array.isArray(up.input.historyMessages))
 })
 
@@ -696,10 +740,10 @@ await ok("F8 带 tool_calls / tool 结果的多轮 → 上游 input 非空且不
   })
   await res.text()
   const up = JSON.parse(requests.at(-1).body)
-  const joined = [up.input.content, ...up.input.historyMessages.map((m) => m.content)].join("\n")
+  const joined = [up.input.input, ...up.input.historyMessages.map((m) => m.content)].join("\n")
   assert.ok(joined.includes("get_weather"), "工具调用丢了")
   assert.ok(joined.includes("晴 30 度"), "工具结果丢了")
-  assert.ok(up.input.content.includes("工具结果"), "末轮工具结果应成为 input")
+  assert.ok(up.input.input.includes("工具结果"), "末轮工具结果应成为 input")
 })
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -712,14 +756,14 @@ handler = (req, res) => {
 }
 
 const modelCases = [
-  ["G1 model 缺失（undefined）→ 默认 deepseek", undefined, "deepseek-chat-latest"],
-  ["G2 provider 前缀 orcaterm/kimi", "orcaterm/kimi", "kimi-k2"],
+  ["G1 model 缺失（undefined）→ 默认 deepseek", undefined, "TokenHub/deepseek-v4-pro"],
+  ["G2 provider 前缀 orcaterm/kimi", "orcaterm/kimi", "TokenHub/kimi-k3"],
   ["G3 大小写混写 ORCATERM/Kimi-K2-Thinking", "ORCATERM/Kimi-K2-Thinking", "kimi-k2-thinking"],
-  ["G4 前后空格 ' Kimi '", " Kimi ", "kimi-k2"],
+  ["G4 前后空格 ' Kimi '", " Kimi ", "TokenHub/kimi-k3"],
   ["G5 未知模型原样透传（不 404）", "brand-new-model", "brand-new-model"],
-  ["G6 空串 → 默认", "", "deepseek-chat-latest"],
+  ["G6 空串 → 默认", "", "TokenHub/deepseek-v4-pro"],
   ["G7 数字 model 不崩", 123, "123"],
-  ["G8 只有斜杠 'orcaterm/' → 应回落默认模型", "orcaterm/", "deepseek-chat-latest"],
+  ["G8 只有斜杠 'orcaterm/' → 应回落默认模型", "orcaterm/", "TokenHub/deepseek-v4-pro"],
 ]
 
 for (const [name, model, expect] of modelCases) {
@@ -739,7 +783,7 @@ console.log("\n[H] 用量 / 路径一致性 / 非流式中断")
 
 const usageOf = (out) => out.find((c) => c?.usage)?.usage
 
-await ok("H1 include_usage 的 prompt_tokens 应随输入增长（不能恒为 1）", async () => {
+await ok("H1 include_usage → 大输入也不伪造 usage（上游没有真实 token 数）", async () => {
   handler = (req, res) => {
     sseHead(res)
     res.end(dataLine({ content: "ok" }) + "data: [DONE]\n\n")
@@ -756,15 +800,12 @@ await ok("H1 include_usage 的 prompt_tokens 应随输入增长（不能恒为 1
     stream_options: { include_usage: true },
     messages: [{ role: "user", content: "字".repeat(3000) }],
   })
-  const u1 = usageOf(small.out)
-  const u2 = usageOf(big.out)
-  assert.ok(u1, "小输入没发 usage 帧")
-  assert.ok(u2, "大输入没发 usage 帧")
-  assert.ok(
-    u2.prompt_tokens > u1.prompt_tokens,
-    `prompt_tokens 不随输入增长（小=${u1.prompt_tokens}，大=${u2.prompt_tokens}）：` +
-      `estimateTokens 拿的是「上游 body」而不是 OpenAI body，body.messages 恒为 undefined → 恒为 1`,
-  )
+  // 上游不返回 token 数；按字符估算再当 usage 上报，会让费用与上下文统计失真
+  assert.equal(usageOf(small.out), undefined, "不应伪造 usage 帧")
+  assert.equal(usageOf(big.out), undefined, "不应伪造 usage 帧")
+  // 但两条流的正文都必须是完整的，不能因为不发 usage 就丢了内容
+  assert.ok(contentOf(small.out).includes("ok"))
+  assert.ok(contentOf(big.out).includes("ok"))
 })
 
 await ok("H2 非流式 + 上游只用 fullContent → 内容不能是占位空回复（与流式路径一致）", async () => {
@@ -779,18 +820,19 @@ await ok("H2 非流式 + 上游只用 fullContent → 内容不能是占位空�
   assert.equal(got, "一二三", `非流式路径不认 fullContent（upstreamToJSON.absorb 只读 ev.content）：实际 ${JSON.stringify(got)}`)
 })
 
-await ok("H3 reasoning 后紧跟 [ERROR] → 错误信息应留在末尾，不能被思考文本顶掉", async () => {
+await ok("H3 reasoning 后紧跟 [ERROR] → 以错误结束，错误原因不被思考文本顶掉", async () => {
   handler = (req, res) => {
     sseHead(res)
     res.write(dataLine({ reasoningContent: "我先想想" }))
     res.end("data: [ERROR]:额度已用尽\n\n")
   }
-  const { out } = await askText(SIMPLE)
-  const c = contentOf(out)
-  assert.ok(c.includes("额度已用尽"), `错误信息丢了：${JSON.stringify(c)}`)
+  // 设计：流中途的失败要使这条流错误结束（不是发完思考再正常收尾），
+  // 且错误原因必须是上游那句，而不是「我先想想」。
+  const { out, text, err } = await askTextSafe(SIMPLE)
+  assert.ok(err, `流应以错误结束（实际没有报错，正文=${JSON.stringify(contentOf(out))}）`)
   assert.ok(
-    c.trim().endsWith("额度已用尽"),
-    `思考文本被追加到错误之后，用户最后看到的是思考而不是失败原因：${JSON.stringify(c)}`,
+    String(err?.message ?? err).includes("额度已用尽"),
+    `错误原因被思考文本顶掉了：${String(err?.message ?? err)}`,
   )
 })
 
@@ -872,6 +914,82 @@ await ok("H7 上游 200 且无 content-type、body 是 JSON 错误 → 应报错
     surfaced,
     `无 content-type 的 JSON 错误被静默吞掉：status=${status}，body 前 80 字=${JSON.stringify(text.slice(0, 80))}`,
   )
+})
+
+// ══════════════════════════════════════════════════════════════════════════
+// [I] 动作信封（上游真实分片）
+// ══════════════════════════════════════════════════════════════════════════
+console.log("\n[I] 动作信封")
+
+// 上游真的会这么发：整段回答是一个 assistant 消息对象，按字符切开流出来
+// （2026-10-27 实测帧：{"id":…,"content":"{\n","reasoningContent":""…}）
+const ENVELOPE_DELTAS = [
+  "",
+  "{\n",
+  '  "',
+  'action":',
+  ' "com',
+  'pletion",\n',
+  '  "',
+  "ph_",
+  '1":',
+  ' "--",\n',
+  '  "',
+  "taskCompletion",
+  '":',
+  ' "用一句',
+  "话介绍",
+  "你自己",
+  '",\n',
+  '  "',
+  "action",
+  'Id":',
+  " null\n",
+  "}",
+]
+
+await ok("I1 信封按真实分片流出 → 只出 taskCompletion 的正文", async () => {
+  handler = (req, res) => {
+    sseHead(res)
+    for (const d of ENVELOPE_DELTAS) res.write(dataLine({ content: d, reasoningContent: "", reasoning: false, type: "ai", code: 0 }))
+    res.end("data: [DONE]\n\n")
+  }
+  const { out } = await askTextSafe(SIMPLE)
+  assert.equal(contentOf(out), "用一句话介绍你自己", `信封没解包或正文被改：${JSON.stringify(contentOf(out))}`)
+  assert.ok(!contentOf(out).includes("taskCompletion"), "信封字段漏到了正文里")
+  assert.ok(!contentOf(out).includes("action"), "信封字段漏到了正文里")
+})
+
+await ok("I2 正文在前、```json 围栏信封在后 → 围栏与信封都不出现在正文里", async () => {
+  handler = (req, res) => {
+    sseHead(res)
+    res.write(dataLine({ content: "已记住你的名字。" }))
+    res.write(dataLine({ content: '```json\n{\n  "action": "completion",\n  "taskCompletion": "已记住。"\n}\n```' }))
+    res.end("data: [DONE]\n\n")
+  }
+  const res = await ask(SIMPLE)
+  const text = await res.text()
+  assert.ok(text.includes("已记住你的名字。"), `正文丢了：${JSON.stringify(text.slice(0, 200))}`)
+  assert.ok(!text.includes("taskCompletion"), "信封漏到了正文里")
+  assert.ok(!text.includes("```json"), "围栏漏到了正文里")
+})
+
+await ok("I3 非流式：正文 + 围栏信封 → 只留正文", async () => {
+  handler = (req, res) => {
+    sseHead(res)
+    res.write(dataLine({ content: "好的，" }))
+    res.write(
+      dataLine({
+        content:
+          '```json\n{\n  "action": "completion",\n  "ph_1": "--",\n  "taskCompletion": "好的，已记住。"\n}\n```',
+      }),
+    )
+    res.end("data: [DONE]\n\n")
+  }
+  const res = await ask({ ...SIMPLE, stream: false })
+  const j = await res.json()
+  const c = j.choices[0].message.content
+  assert.equal(c, "好的，", `非流式没切干净：${JSON.stringify(c)}`)
 })
 
 // ══════════════════════════════════════════════════════════════════════════

@@ -13,6 +13,7 @@
  *   3. 若干模型各打一次，列出可用/不可用
  */
 import readline from "node:readline/promises"
+import { randomUUID } from "node:crypto"
 import { stdin, stdout } from "node:process"
 import { _internal } from "./index.mjs"
 
@@ -169,9 +170,10 @@ console.log(`csrfCode=${_internal.csrfCode(ticket.skey)}\n`)
 console.log("── 0. 鉴权面自检（确认错误码落在哪一层） ──")
 {
   const body = JSON.stringify({
-    conversationId: `cid-probe-${Date.now()}`,
+    conversationId: `cid-${randomUUID()}-orcaterm`,
     user: { id: "probe", setting: { model: "deepseek-chat-latest" } },
-    input: { id: "probe", content: "ping", files: [], historyMessages: [] },
+    // 三个助手侧的 input.id 都要是 uuid v4：上游按形状校验，回 Invalid inputId
+    input: { id: randomUUID(), content: "ping", files: [], historyMessages: [] },
     stream: true,
   })
   const url = `${ASSISTANT_BASE}/chat?name=orcaterm&mode=0&csrfCode=${_internal.csrfCode(ticket.skey)}`
