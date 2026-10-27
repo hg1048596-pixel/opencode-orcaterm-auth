@@ -254,7 +254,7 @@ node probe.mjs "uin=o123; skey=xxx"
 ```bash
 npm test                      # 两套一起跑（80 项）
 node test/selftest.mjs        # 32 项：主链路
-node test/edge.mjs            # 48 项：对抗性边界
+node test/edge.mjs            # 51 项：对抗性边界
 ```
 
 `selftest.mjs` 覆盖：纯函数、body 转换、SSE 双向翻译、错误路径、钩子形状、
@@ -294,52 +294,34 @@ node test/edge.mjs            # 48 项：对抗性边界
 | `login.mjs` | 自动登录脚本（持久 profile + CDP 读 cookie） |
 | `import-cookies.mjs` | 尝试从本机浏览器直接导入凭据（v10 可解、v20 不行） |
 | `probe.mjs` | 真机探针，用来校准协议与用量字段 |
-| `test/selftest.mjs` | 主链路自测（33 项） |
-| `test/edge.mjs` | 对抗性边界测试（48 项） |
+| `test/selftest.mjs` | 主链路自测（34 项） |
+| `test/edge.mjs` | 对抗性边界测试（51 项） |
 | `package.json` | `magpie.maxConcurrency` / `magpie.icon` / keywords |
 
-## 9. 已知问题
-
-### 自动扫码登录（未修好）
-
-**症状**：`magpie plugin login orcaterm` 选「浏览器登录（自动）」后，
-界面提示「浏览器调试端口没起来」或停在「登录未完成」。
-
-**两个独立原因**：
-
-1. **全局代理挡住本机回环**
-   magpie 开全局代理时会把 `HTTP_PROXY` 写进环境变量，插件宿主（Bun）的 `fetch`
-   连 `127.0.0.1` 也送进代理 → 调试端口探测失败。
-   *已修*：`login.mjs` 改用 `node:net` 直连（`httpGetLocal`），不走 `fetch`。
-
-2. **持久 profile 损坏**（未修）
-   插件自建 profile（`%LOCALAPPDATA%\orcaterm-magpie\browser-profile`）
-   在一次异常中断后无法监听调试端口 —— 同样参数换成全新目录立刻正常。
-   *未修*：需要删除并重建该 profile，**这一步会动到本地数据，须用户确认后才执行**。
-
-**当前可用的替代路径**（都验证过）：
-
-| 方式 | 命令 | 说明 |
-| --- | --- | --- |
-| 手动粘贴 | `magpie plugin login orcaterm` → 第 2 项 | 一次粘贴长期有效，**推荐** |
-| 从 profile 解密 | `node import-cookies.mjs` | profile 里 cookie 是 v10，能直接解出来 |
-| 单独探针 | `node probe.mjs "uin=…; skey=…"` | 只校验，不写库 |
-
-### 额度窗口只有「AI 问答」
+## 9. 额度窗口只有「AI 问答」
 
 上游 `DescribeUserBillingStatus` 还会返回 `session_share` / `secret` / `space`，
 这些与 AI 额度无关，插件只展示 `hunyuan_ai`（1000 次/月）。
 
+扫码登录的账号读不到配额（额度接口只认控制台会话），账号卡片上不显示额度，这不影响使用。
+
 ## 10. 凭据安全
 
-凭据（`uin` + `skey`）等同于你的腾讯云登录态，插件在几个环节做了约束：
+两种凭据的权限面差别很大：
+
+| 凭据 | 权限范围 | 有效期 |
+| --- | --- | --- |
+| 微信扫码 → OAuth accessToken | **只对 OrcaTerm 生效** | 2 小时，自动续期 |
+| 粘贴 `uin` + `skey` | **等同你的腾讯云登录态**（控制台、CVM、账单、API 密钥） | 长期，直到登出控制台 |
+
+所以推荐扫码。无论哪种，插件在几个环节做了约束：
 
 | 环节 | 处理 |
 | --- | --- |
 | 最终存放 | 只存 magpie 自己的 `plugin-auth.json`（权限 600） |
 | 登录过程中的中转文件 | 写在私有目录 `%LOCALAPPDATA%\orcaterm-magpie\login-state`（不是共享 TEMP），权限 0600 |
 | 中转文件生命周期 | 读到即删；登录成功/失败/取消都会清理 |
-| 日志 | 不打印 `uin` / `skey` / cookie；错误信息里的 URL 会去掉查询串（`redactUrl`） |
+| 日志 | 不打印凭据；错误信息里的 URL 会去掉查询串（`redactUrl`） |
 | 仓库 | `.gitignore` 排除 `*.ticket` / `ot-ticket.*`；npm `files` 只含源码与文档 |
 | 测试 | 用的都是 `o1234567890` / `SECRET123456` 这类占位值 |
 
