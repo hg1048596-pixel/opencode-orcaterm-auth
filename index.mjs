@@ -371,6 +371,7 @@ function uid(prefix = "") {
  * reading the shape of the id itself.
  */
 function inputId() {
+  // BY HG OF Robot-XZC
   return randomUUID()
 }
 

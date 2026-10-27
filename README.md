@@ -1,31 +1,26 @@
 # opencode-orcaterm-auth
 
-> ## ⚠️ 已知问题：自动扫码登录尚未修好
+> ## 📌 建议只用 OrcaTerm 模型选择器里出现的那几个模型
 >
-> **`magpie plugin login orcaterm` → 选「浏览器登录（自动）」目前可能失败**，
-> 界面上会显示「浏览器调试端口没起来」或「登录未完成」。
+> 插件按 id 能列出更多模型，但**只有下面这九个在 OrcaTerm 自己的模型选择器里能选**：
+> Hy4-preview、Hy3、Kimi-K3、GLM-5.3-Flash、GLM-5.3、GLM-5.2、DeepSeek-V4.1-Flash、
+> DeepSeek-V4-Flash、Deepseek-V4-Pro。
 >
-> **请直接用「手动粘贴 cookie」那条路**（第 2 项），一次粘贴长期有效：
->
-> ```bash
-> magpie plugin login orcaterm     # 选第 2 项：手动粘贴 cookie
-> ```
->
-> 原因：插件自建的浏览器 profile 曾被异常中断，导致 `--remote-debugging-port`
-> 无法监听；叠加 magpie 的**全局代理**会让 Bun 的 `fetch` 把 `127.0.0.1` 也送进代理
-> （已在脚本里改用 `node:net` 直连绕开，但 profile 本身仍需重建）。
-> 重建 profile 需要你确认后才会执行，详见 [§9 已知问题](#9-已知问题)。
+> 其余 id（如 `deepseek-reasoner`、`qwen3`、`kimi-latest`、`hunyuan-turbos` 等）虽然在接口上
+> 能通，但**在 OrcaTerm 里无法直接选用**，属于绕过界面调用，**不建议使用**——上游可能据此判定
+> 异常，**存在封号风险**。要用就只用上面九个。
 
 把**腾讯云 OrcaTerm（遨驰终端）AI 助手**的问答额度，反代成 **OpenAI Chat Completions 兼容**接口，
 作为 magpie / OpenCode 的供应商插件使用。写完就能用：
 
 ```bash
 magpie plugin add ./orcaterm-magpie-plugin
-magpie plugin login orcaterm          # 选「手动粘贴 cookie」
+magpie plugin login orcaterm          # 选第 1 项：微信扫码登录（推荐）
 magpie provider test orcaterm
 ```
 
-模型 id 形如 `orcaterm/deepseek`、`orcaterm/kimi`、`orcaterm/glm`，任何 agent 都能直接选。
+模型名形如 `orcaterm/Deepseek-V4-Pro`、`orcaterm/GLM-5.3`、`orcaterm/Kimi-K3`，任何 agent 都能直接选
+（大小写与界面标签都能用）。
 
 ---
 
@@ -52,12 +47,44 @@ agent ──OpenAI/Anthropic/Gemini 任意协议──▶ magpie 网关
   这里逐帧翻译成 `chat.completion.chunk`（`delta.content` / `delta.reasoning_content`），
   兼容上游「累计全文」与「纯增量」两种发法，最后补 `finish_reason` 与可选 `usage` 帧。
 
-## 2. 登录：为什么必须粘贴 cookie
+## 2. 登录：微信扫码（推荐）
 
-OrcaTerm 的会话接口**不接受 API key**，只认 `tencent.com` 域下的 **HttpOnly cookie**（`uin` + `skey`）。
-浏览器不会把 HttpOnly cookie 交出去，插件也没有登录令牌，所以走「粘贴凭据」。
+插件的上游鉴权有两种凭据，**扫码拿到的那种权限面小得多**：
 
-### 上游鉴权面（2026-10-26 实测）
+| 凭据 | 来源 | 有效期 | 权限范围 |
+| --- | --- | --- | --- |
+| `uin` + `skey` | 腾讯云**控制台完整会话** cookie | 长期，直到登出控制台 | 整个腾讯云控制台 |
+| **OAuth accessToken** | OrcaTerm 微信扫码 | **2 小时，自动续期** | 仅 OrcaTerm |
+
+所以首选扫码。两种都可以用，插件按 key 的形状自动判别（`eyJ…` 开头 → Bearer，其余 → cookie）。
+
+### 方式一：微信扫码（推荐）
+
+```bash
+magpie plugin login orcaterm     # 选第 1 项
+```
+
+会打开 `http://127.0.0.1:4080/login`，页内是微信二维码，**扫完自动继续**，不用复制任何链接。
+
+原理：页面用官方 `wxLogin.js` 内嵌二维码，并设 `self_redirect: true` —— 这样扫码后的回跳落在
+它自建的内层 iframe 里，OrcaTerm 的回调页能把 `code` `postMessage` 回宿主页。不设这个参数的话，
+微信会做顶层跳转把宿主页顶掉，消息就永远收不到了。
+
+远程部署（magpie 装在服务器上）时页面监听在服务器回环地址，需要转发端口：
+
+```bash
+ssh -L 4080:127.0.0.1:4080 <server>
+```
+
+端口/监听地址可用 `ORCATERM_CAPTURE_PORT`、`ORCATERM_CAPTURE_HOST`、`ORCATERM_CAPTURE_BASE` 改。
+
+token 到期前 magpie 会用 `OAuthRefreshToken` 自动换新的，正常使用**不会**要求重新扫码。
+
+### 方式二：手动粘贴 cookie（备用）
+
+选第 3 项，粘贴 `uin=o123456789; skey=AbCdEf...`。长期有效，但等同于把控制台会话交给插件。
+
+### 上游 cookie 鉴权面（2026-10-26 实测，仅 cookie 方式适用）
 
 | 送出的 cookie | 上游返回 | 说明 |
 | --- | --- | --- |
@@ -70,30 +97,12 @@ OrcaTerm 的会话接口**不接受 API key**，只认 `tencent.com` 域下的 *
 另外实测：`csrfCode` 参数、`Origin` / `Referer`、`X-CsrfCode` 头**都不是门槛**，
 值错或缺失都不会改变错误码——真正决定成败的只有 `uin` + `skey` 这一对。
 
-所以插件在 `loader` 里就强制要求两者齐全：只有 skey 会直接返回空对象（账号显示不可用），
-不会把一次注定失败的请求打到上游。
+### 方式三：拉起本机浏览器（性能受限，仍可用）
 
-### 操作步骤
+选第 2 项。它拉起一个带调试端口的浏览器，靠 CDP 读 HttpOnly cookie。
+**这条路对 profile 状态和全局代理敏感**，失败时改用手扫码或粘贴 cookie 即可。
 
-**方式一：自动登录（推荐）**
-
-```bash
-magpie plugin login orcaterm
-```
-
-选「浏览器登录 OrcaTerm（自动，推荐）」，再选「复用上次登录态（免扫码）」：
-
-- **第一次**：会打开一个浏览器窗口，微信扫码 → 自动读取凭据 → 完成登录；
-- **以后**：同一个 profile 里 cookie 还在，**直接免扫码完成**；
-- cookie 失效时（通常几天到几周）会自动打开登录页让你重扫。
-
-全程不需要手动复制 cookie。
-
-**方式二：手动粘贴 cookie**
-
-选第二项，粘贴 `uin=o123456789; skey=AbCdEf...`。
-
-**方式三：单独跑登录脚本**
+### 方式四：单独跑登录脚本
 
 ```bash
 node login.mjs                 # 持久 profile：首次扫码，之后免扫码
@@ -183,19 +192,32 @@ magpie 开着全局代理时，插件宿主（Bun）的 `fetch` 会读 `HTTP_PRO
 
 ## 3. 模型
 
-| 模型 id | 展示名 | 思考 | 上下文 |
-| --- | --- | --- | --- |
-| `deepseek-chat-latest` | DeepSeek-V4-Pro | ✓ | 128k |
-| `hy3-preview` | Hy3-preview（混元） | ✓ | 256k |
-| `glm-4.7` | GLM-5.2（智谱） | | 200k |
-| `glm-4.7-thinking` | GLM-5.2 Thinking | ✓ | 200k |
-| `kimi-k2` | Kimi-k2.6（月之暗面） | | 256k |
-| `kimi-k2-thinking` | Kimi-k2 Thinking | ✓ | 256k |
-| `hunyuan-turbos` | Hunyuan TurboS | | 128k |
-| `hunyuan-t1` | Hunyuan T1 | ✓ | 128k |
+### 只用这九个（OrcaTerm 选择器里能选到的）
 
-别名可用：`deepseek`、`kimi`、`glm`、`hunyuan`、`moonshot`…（见 `index.mjs` 的 `MODEL_SPECS.aliases`）。
-上游若上线新模型，请求里直接写它的 id 会**透传**过去，不必等插件发版。
+| 模型 id（发给上游） | 展示名 | 思考 | 上下文 |
+| --- | --- | --- | --- |
+| `TokenHub/deepseek-v4-pro` | Deepseek-V4-Pro | ✓ | 128k |
+| `TokenHub/deepseek-v4-flash` | DeepSeek-V4-Flash | | 128k |
+| `TokenHub/deepseek-v4.1-flash` | DeepSeek-V4.1-Flash | | 128k |
+| `TokenHub/glm-5.3` | GLM-5.3 | ✓ | 200k |
+| `TokenHub/glm-5.3-flash` | GLM-5.3-Flash | | 200k |
+| `TokenHub/glm-5.2` | GLM-5.2 | | 200k |
+| `TokenHub/kimi-k3` | Kimi-K3 | | 256k |
+| `Hunyuan3/hy3` | Hy3 | ✓ | 256k |
+| `Hunyuan3/hy4-preview` | Hy4-preview | ✓ | 256k |
+
+> ⚠️ **下面这些不要用。** 它们在接口上能通，但**在 OrcaTerm 的模型选择器里选不到**，
+> 属于绕过界面直接调用，上游可能据此判定异常，**有封号风险**：
+> `glm-4.7-thinking`、`kimi-k2-thinking`、`kimi-k2.5`、`kimi-k2.5-thinking`、`kimi-latest`、
+> `hunyuan-turbos`、`qwen3`、`deepseek-reasoner`。
+> 它们留在清单里只是为了让已有的配置不至于断掉，**新配置请只用上面那九个**。
+
+**id 是带命名空间的。** 这是最容易踩的坑：`glm-5.3` 会被上游拒成
+`LLM(glm-5.3) is not loaded`，而 `TokenHub/glm-5.3` 正常——前缀就是全部差别。
+
+别名可用：`deepseek`、`kimi`、`glm`、`hunyuan`、`moonshot`，以及界面标签本身
+（`Deepseek-V4-Pro`、`GLM-5.3`、`Hy3-preview`…）。旧 id 如 `deepseek-chat-latest`、`glm-4.7`、
+`kimi-k2`、`hunyuan-t1` 也会解析到对应的新 id（见 `index.mjs` 的 `MODEL_SPECS.aliases`）。
 
 `cost` 全为 0：这是额度制，不是按 token 计费，避免 magpie 把它当付费模型参与比价。
 
