@@ -1,0 +1,36 @@
+# 0.2.1
+
+修掉 `[LLM_ERROR]: Invalid inputId: in-…`，并修正模型清单与答案解析。全部结论来自对真实接口的实测。
+
+## 修复
+
+- **`Invalid inputId`（issue #1）**：`input.id` 必须是 uuid v4，之前发的是 `in-` + 24 位 hex。
+  改用 `crypto.randomUUID()`，每次请求新生成。旧形状至今仍被上游拒绝，所以这不是上游放宽了。
+- **模型 id 缺命名空间前缀**：模型要用 `TokenHub/<model>` 和 `Hunyuan3/<model>`。
+  发裸名 `glm-5.3` 会被拒成 `LLM(glm-5.3) is not loaded`，加前缀才通。桌面端选择器里
+  那九个模型现在全部可用。
+- **答案被 JSON 信封包住**：上游流的是助手自己的消息对象
+  `{"action":"completion","taskCompletion":"…"}`，有时带围栏、有时散文在前。现在会解包，
+  且流式与非流式共用同一个解析器（之前各写一份，非流式因此会对同一份字节答"空回复"）。
+- **多轮丢上下文**：magpie 每次请求都给新的 `sessionID`，服务端会话状态靠不住；
+  历史改为以 transcript 写进 `input.input`，`historyMessages` 保持为空。
+- **限流**：上游每账号 10 次/分钟，打满返回的是 HTTP 200 + `{"code":429,…}`（不是 SSE 错误帧）。
+  新增滑动窗口控速 + 429 冷却，`maxConcurrency` 改为 1。
+
+## 新增
+
+- **微信扫码登录**（`magpie plugin login orcaterm` 第一项）：本地页面 `127.0.0.1:4080` 内嵌
+  二维码，扫完自动继续。拿到的是 OrcaTerm 自己的 OAuth accessToken —— 两小时有效、自动续期、
+  只能用于 OrcaTerm；比原来的 `uin`+`skey`（等同腾讯云控制台完整会话）权限面小得多。
+  两种凭据都支持，按 key 形状自动判别，老配置不受影响。
+- 环境变量：`ORCATERM_CHAT_RPM`（限流额度）、`ORCATERM_NO_PACE=1`（关闭控速）、
+  `ORCATERM_CAPTURE_PORT` / `_HOST` / `_BASE`（扫码页面地址）。
+
+## 注意
+
+- **只用 OrcaTerm 模型选择器里那九个模型**。其余 id 虽然在接口上能通，但在选择器里选不到，
+  属于绕过界面调用，**有封号风险**，README 已写明。
+
+## 测试
+
+34（selftest）+ 51（edge）= 85 项全过。
