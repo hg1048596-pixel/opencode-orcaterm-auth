@@ -1,8 +1,9 @@
 # 依赖
 node_modules/
 
-# npm 打包产物
+# npm 打包产物（package/ 里放的是发布到 npm 的那一份，要进仓库）
 *.tgz
+!package/*.tgz
 
 # 测试/调试临时文件
 test/tmp/

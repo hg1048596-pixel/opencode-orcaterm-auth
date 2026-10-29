@@ -37,15 +37,29 @@ agent ──OpenAI/Anthropic/Gemini 任意协议──▶ magpie 网关
 ```
 
 - **入**：gateway 已把各类协议统一成 `POST /chat/completions` 的 body。
-- **转**：`toUpstreamBody()` 把 `messages[]` 压成 OrcaTerm 要的
-  `{conversationId, user:{setting}, input:{content, historyMessages}, stream:true}`：
-  - `system` / `developer` 拼成带标记的前缀，塞进 `input.content`（上游没有 system 字段）；
-  - 除最后一条 user 外全部进 `historyMessages`；
+- **转**：`toUpstreamBody()` 把 `messages[]` 压成 OrcaTerm 要的形状：
+  `{conversationId, user:{setting}, input:{id, type:"start", input, files:[], historyMessages:[]}, stream:true}`
+  - `input.id` 必须是 **uuid v4**（见 [§9](#9-额度窗口只有ai-问答) 之外的说明：上游对形状有硬校验）；
+  - `system` / `developer` 拼成带标记的前缀，塞进 `input.input`（上游没有 system 字段）；
+  - **之前的轮次以 transcript 写进 `input.input`，`historyMessages` 恒为空**：历史条目的类型字段是
+    `type` 不是 `role`（传 `role` 上游会崩在 `[type] is not a function`），而形状对了文本又会被回显进回答；
   - `tool_calls` 与 `tool` 结果降级成普通文本轮次——**上游不执行工具循环**，
     工具调用由客户端自己完成，插件只做文本往返。
 - **出**：上游是 SSE，正文在 `content`、思考在 `reasoningContent`；
   这里逐帧翻译成 `chat.completion.chunk`（`delta.content` / `delta.reasoning_content`），
-  兼容上游「累计全文」与「纯增量」两种发法，最后补 `finish_reason` 与可选 `usage` 帧。
+  兼容上游「累计全文」与「纯增量」两种发法，最后补 `finish_reason`（不发 `usage` 帧）。
+
+### 会连到哪些主机
+
+| 主机 | 什么时候 | 发过去什么 |
+| --- | --- | --- |
+| `lightai.cloud.tencent.com` | 每次对话 | 凭据、消息正文 |
+| `api.orcaterm.cloud.tencent.com` | 读额度（仅 cookie 登录） | 凭据 |
+| `orcaterm.com` | 扫码登录、续期 token | 凭据、OAuth `code` |
+| `res.wx.qq.com` | 扫码页面 | 无——只是加载微信的 `wxLogin.js` |
+| `open.weixin.qq.com` | 二维码 iframe | OrcaTerm 下发的 `appid` / `redirect_uri` / `state` |
+
+前三个属于腾讯，后两个属于微信，且**只有扫码登录时才会加载**，cookie 登录不碰它们。除此之外不发往任何地方。
 
 ## 2. 登录：微信扫码（推荐）
 
@@ -281,9 +295,11 @@ node test/edge.mjs            # 51 项：对抗性边界
 - **无工具执行**：上游是「终端助手」而非函数调用 API，`tool_calls` 只能降级成文本。
   Agent 侧的工具仍由客户端自己跑，插件不参与。
 - **无图片**：`image_url` 只被替换成 `[图片]` 占位（`user.setting.multimodal` 默认关）。
-- **上下文靠重放**：上游按 `conversationId` 存会话，插件为每个账号生成一个稳定 id；
-  但为了每轮都准确，仍把完整历史放进 `historyMessages` 重放一遍。
-- **并发**：`package.json` 里 `magpie.maxConcurrency: 2`，OrcaTerm 对并发敏感，别调高。
+- **上下文靠 transcript**：magpie 每个请求都给新的 session id，服务端会话状态靠不住，
+  所以之前的轮次写进 `input.input` 的 transcript，`historyMessages` 恒为空。
+  插件**不再** `POST /conversation` 登记会话（每请求新 id，登记等于每请求一条记录）。
+- **限流 10 次/分钟/账号**：打满时上游返回 **HTTP 200 + `{"code":429,…}`**（不是 SSE 错误帧）。
+  插件按账号各自控速、429 后冷却；`maxConcurrency: 1`，别调高。
 - **协议会变**：上游是未公开接口，改版后按 `probe.mjs` 的输出和 `index.mjs` 顶部的常量区对一遍即可。
 
 ## 8. 文件
