@@ -312,7 +312,7 @@ node test/edge.mjs            # 51 项：对抗性边界
 | `probe.mjs` | 真机探针，用来校准协议与用量字段 |
 | `test/selftest.mjs` | 主链路自测（34 项） |
 | `test/edge.mjs` | 对抗性边界测试（51 项） |
-| `package.json` | `magpie.maxConcurrency` / `magpie.icon` / keywords |
+| `package.json` | `magpie.maxConcurrency` / `magpie.icon` / keywords（`maxConcurrency` 同时写在 auth 钩子上） |
 
 ## 9. 额度窗口只有「AI 问答」
 
