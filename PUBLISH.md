@@ -7,14 +7,14 @@
 
 | 项 | 状态 |
 | --- | --- |
-| `package.json` 有 `name` / `version` / `type` / `main` | ✅ `opencode-orcaterm-auth` @ `0.2.0` |
+| `package.json` 有 `name` / `version` / `type` / `main` | ✅ `opencode-orcaterm-auth` @ `0.2.3` |
 | `exports["./server"]` 指向入口 | ✅ `./index.mjs` |
 | 入口只导出 `default {id, server}` 与 `_internal` | ✅ 无多余函数导出（magpie 会把导出的函数都当插件跑） |
 | `keywords` 含 `opencode` + `opencode-plugin` + 厂商名 | ✅ `orcaterm` / `tencent` / `provider` |
-| `magpie.maxConcurrency` | ✅ `2`（1–1000 整数） |
+| `magpie.maxConcurrency` | ✅ `1`（1–1000 整数），auth 钩子上也声明了 |
 | `magpie.icon` | ✅ 内联 `data:image/png`，192×192，13 KB（上限 1 MB） |
-| `files` 只含运行必需文件 | ✅ 6 个文件，打包 45.9 kB |
-| 单元测试 | ✅ 33 + 48 = 81 项全过 |
+| `files` 只含运行必需文件 | ✅ 10 个文件，打包 71 kB |
+| 单元测试 | ✅ 34 + 51 = 85 项全过 |
 | `npm pack --dry-run` | ✅ 正常 |
 
 > `repository` / `homepage` / `bugs` 已指向 <https://github.com/hg1048596-pixel/opencode-orcaterm-auth>，
@@ -39,7 +39,7 @@ npm publish --access public
 
 ```bash
 magpie plugin add opencode-orcaterm-auth
-magpie plugin add opencode-orcaterm-auth@0.2.0     # 固定版本
+magpie plugin add opencode-orcaterm-auth@0.2.3     # 固定版本
 ```
 
 ## 三、GitHub 仓库（两个用途）
