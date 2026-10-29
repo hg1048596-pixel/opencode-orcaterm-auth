@@ -1,3 +1,17 @@
+# 0.2.4
+
+纯文档改动，**代码与 0.2.3 逐字节相同**（`index.mjs` / `wechat.mjs` / `login.mjs` /
+`import-cookies.mjs` / `probe.mjs` 的 SHA256 全部一致）。发这一版只是为了让 npm 上的 README
+跟上仓库：0.2.3 的 npm 页面还是改口径之前的内容。
+
+- README 与社区包、PR 正文统一口径：13 条可核对事实逐条一致（模型命名空间、九个推荐 id、
+  五个主机及各自收到什么、transcript 承载上下文、429 的两种到达方式、10 次/分钟、per-account 控速等）。
+- 修正请求格式描述：`input:{content, historyMessages}` → `input:{id, type, input, files, historyMessages:[]}`，
+  并说明之前的轮次走 transcript、`historyMessages` 恒为空，也不再 `POST /conversation`。
+- 补「会连到哪些主机」表与限流说明；`maxConcurrency` 订正为 1，并注明 auth 钩子上也声明了。
+- `PUBLISH.md` 的版本号与随版本漂移的数字（文件数、打包体积、测试项数）一并订正。
+- `package/` 放入与 npm 逐字节相同的 0.2.4 发布产物，并给出 sha1 便于核对。
+
 # 0.2.3
 
 纯文档改动，功能与 0.2.2 相同。

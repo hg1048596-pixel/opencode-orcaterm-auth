@@ -1,4 +1,4 @@
-# 发布与上架
+﻿# 发布与上架
 
 按 [magpie 官方文档「发布与上架」](https://usemagpie.ai/docs/zh/plugins#publish) 整理的步骤。
 本目录已把能自动化的部分做完，剩下需要账号/凭据的步骤由你执行。
@@ -7,7 +7,7 @@
 
 | 项 | 状态 |
 | --- | --- |
-| `package.json` 有 `name` / `version` / `type` / `main` | ✅ `opencode-orcaterm-auth` @ `0.2.3` |
+| `package.json` 有 `name` / `version` / `type` / `main` | ✅ `opencode-orcaterm-auth` @ `0.2.4` |
 | `exports["./server"]` 指向入口 | ✅ `./index.mjs` |
 | 入口只导出 `default {id, server}` 与 `_internal` | ✅ 无多余函数导出（magpie 会把导出的函数都当插件跑） |
 | `keywords` 含 `opencode` + `opencode-plugin` + 厂商名 | ✅ `orcaterm` / `tencent` / `provider` |
@@ -39,7 +39,7 @@ npm publish --access public
 
 ```bash
 magpie plugin add opencode-orcaterm-auth
-magpie plugin add opencode-orcaterm-auth@0.2.3     # 固定版本
+magpie plugin add opencode-orcaterm-auth@0.2.4     # 固定版本
 ```
 
 ## 三、GitHub 仓库（两个用途）
