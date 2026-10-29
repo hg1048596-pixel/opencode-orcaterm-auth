@@ -7,8 +7,8 @@
  * Upstream protocol (reverse-engineered from orcaterm.cloud.tencent.com's
  * frontend bundle, the 2026-10 build):
  *   chat endpoint   POST {ASSISTANT_BASE}/chat?name=<assistant>&mode=<0|1|2>&csrfCode=<skey-hash>
- *                   body: {conversationId, user:{id, setting:{...}}, input:{id, content, files,
- *                          historyMessages}, stream:true}
+ *                   body: {conversationId, user:{id, setting:{...}}, input:{id, type:"start",
+ *                          input:<system prefix + transcript + current turn>, files:[], historyMessages:[]}, stream:true}
  *                   headers: x-seqid + cookie(uin/skey) + the browser-family headers
  *                   response: SSE, one `data: {...}` per line; the text is in content, the
  *                   thinking in reasoningContent
@@ -723,9 +723,9 @@ function resolveModel(requested) {
 /**
  * OrcaTerm's assistant only takes "one user message + a list of history
  * messages"; it has no system field. So OpenAI's messages are squeezed into:
- *   - system/developer joined together at the head of input.content (marked, so
+ *   - system/developer joined together at the head of input.input (marked, so
  *     the model can tell them apart)
- *   - everything except the last user message goes into historyMessages
+ *   - earlier turns become a transcript in input.input; historyMessages stays empty
  *   - assistant.tool_calls / tool results degrade into plain text turns
  */
 function toUpstreamBody(body, { conversationId, userId }) {
@@ -1883,9 +1883,8 @@ async function capiRequest(auth, action, data = {}) {
 }
 
 // ---- the plugin itself ------------------------------------------------------
-// Note: magpie calls every function an entry module exports as a plugin, so the
-// factory isn't exported on its own and only hangs off default.server (the
-// OpenCode v1 shape).
+// The named OrcaTermAuthPlugin export is the plugin entry; _internal below is an
+// object for tests, so magpie does not call it as a second plugin.
 export const OrcaTermAuthPlugin = async ({ client } = {}) => {
   const log = (level, message) => {
     try {

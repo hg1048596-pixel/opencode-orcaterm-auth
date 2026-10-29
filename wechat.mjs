@@ -317,8 +317,10 @@ export function createLocalCapture({ appid, redirectUri, state, timeoutMs = 3000
           /* ignore */
         }
         if (!body || typeof body !== "object" || Array.isArray(body) ||
-            typeof body.state !== "string" || typeof body.code !== "string" ||
-            (body.error !== undefined && typeof body.error !== "string")) {
+            typeof body.state !== "string" ||
+            (body.error !== undefined && typeof body.error !== "string") ||
+            (body.code !== undefined && typeof body.code !== "string") ||
+            (typeof body.code !== "string" && !body.error)) {
           res.writeHead(400, { "content-type": "application/json" })
           res.end(JSON.stringify({ ok: false, error: "invalid callback body" }))
           return

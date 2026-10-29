@@ -4,7 +4,8 @@
 
 | 文件 | 版本 | SHA1 |
 | --- | --- | --- |
-| `opencode-orcaterm-auth-0.2.5.tgz` | 0.2.5，本轮修复版 | `56823cb481aba83c3ad29d74fd8033f5fe81b7cd` |
+| `opencode-orcaterm-auth-0.2.6.tgz` | 0.2.6，最新准备版 | `33a529d83627f995434cdaac8b3cfafd5b1075a6` |
+| `opencode-orcaterm-auth-0.2.5.tgz` | 0.2.5，上一修复版（npm 未发布） | `56823cb481aba83c3ad29d74fd8033f5fe81b7cd` |
 | `opencode-orcaterm-auth-0.2.4.tgz` | 0.2.4 | `89a070e3ca4f0965a1abc755291e6d0afeca9fd0` |
 | `opencode-orcaterm-auth-0.2.3.tgz` | 0.2.3 | `f11a418c7d29105d37a8332ffc98e5a682169888` |
 
@@ -14,9 +15,9 @@
 
 ```powershell
 New-Item -ItemType Directory unpacked -Force
-tar -xzf opencode-orcaterm-auth-0.2.5.tgz -C unpacked
+tar -xzf opencode-orcaterm-auth-0.2.6.tgz -C unpacked
 magpie plugin add ./unpacked/package
 magpie plugin login orcaterm
 ```
 
-发布后用 `npm view opencode-orcaterm-auth@0.2.5 dist.shasum` 核对以上 SHA1。
+发布后用 `npm view opencode-orcaterm-auth@0.2.6 dist.shasum` 核对以上 SHA1。

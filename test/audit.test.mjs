@@ -170,3 +170,18 @@ test("callback rejects invalid JSON shapes and remains alive for a valid scan", 
     assert.deepEqual(await cap.wait, { code: "C", state: "audit-state" })
   } finally { cap.close() }
 })
+
+test("callback preserves bridge errors without a code and still permits a later scan", async () => {
+  const cap = i.createLocalCapture({ appid: "audit", redirectUri: "https://orcaterm.com/oauth/wechat/bridge", state: "audit-state", timeoutMs: 5000 })
+  try {
+    const url = await cap.ready
+    const send = (value) => realFetch(new URL("/cb", url), {
+      method: "POST", headers: { "content-type": "application/json", origin: new URL(url).origin, connection: "close" }, body: JSON.stringify(value),
+    })
+    const res = await send({ state: "audit-state", error: "access_denied" })
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { ok: false, error: "access_denied" })
+    assert.equal((await (await send({ code: "C", state: "audit-state" })).json()).ok, true)
+    assert.deepEqual(await cap.wait, { code: "C", state: "audit-state" })
+  } finally { cap.close() }
+})
