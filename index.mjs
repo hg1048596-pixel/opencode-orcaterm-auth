@@ -1,7 +1,7 @@
 /**
  * opencode-orcaterm-auth
  *
- * OrcaTerm (腾讯云遨驰终端, Tencent Cloud's terminal) AI reverse proxy: both an
+ * OrcaTerm (Tencent Cloud's terminal; 腾讯云遨驰终端) AI reverse proxy: both an
  * OpenCode v1 plugin and a magpie provider plugin.
  *
  * Upstream protocol (reverse-engineered from orcaterm.cloud.tencent.com's
@@ -29,459 +29,12 @@ import {
   startWechatLogin,
 } from "./wechat.mjs"
 
-const PROVIDER = "orcaterm"
+import { spawn } from "node:child_process"
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import { homedir, tmpdir } from "node:os"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 
-// ---- upstream constants (the only place to change them) ---------------------
-const ASSISTANT_BASE = "https://lightai.cloud.tencent.com/assistant"
-const CAPI_ORIGIN = "https://orcaterm.cloud.tencent.com"
-const CAPI_URL = "https://api.orcaterm.cloud.tencent.com/cgi/api"
-const WEB_TERMINAL = "https://orcaterm.cloud.tencent.com/terminal"
-
-/** OrcaTerm's built-in assistants (lighthouse/orcaterm/cvm...): which script and tool set runs */
-const ASSISTANT = {
-  orcaterm: "orcaterm",
-  lighthouse: "lighthouse",
-}
-/** 0=RE_ACT 1=PLAN_ACT 2=AUTO_ACT */
-const MODE = { react: 0, planact: 1, autoact: 2 }
-
-/**
- * Upstream model ids (the frontend's bt.* constants, 2026-10 snapshot).
- *
- * `id` is what actually goes into the request body as the model; `name` is only
- * shown in the picker, so it has to match the id — earlier the marketing names
- * on the UI (DeepSeek-V4-Pro, GLM-5.2, Kimi-k2.6) were taken for model names.
- * Those were guessed from interface copy, with nothing behind them, and they
- * don't match what the server actually serves.
- *
- * The context and output caps are estimates too: upstream never publishes a
- * window size for a model.
- */
-/**
- * What OrcaTerm actually serves, and what to call it.
- *
- * The desktop client's own model table has two separate fields, and that is the
- * whole trap here: `newModelId` is the id sent upstream, `modelName` is the
- * label its picker shows. They are not the same string. Measured 2026-10-27
- * against the live endpoint:
- *
- *   label "Deepseek-V4-Pro" → id deepseek-chat-latest ('deepseek-chat-latest') ✓
- *   label "Hy3-preview"     → id hunyuan-t1            ('hunyuan-t1')         ✓
- *   label "GLM-5.2"         → id glm-4.7               ('glm-4.7')            ✓
- *   label "Kimi-k2.6"       → id kimi-k2               ('kimi-k2')            ✓
- *
- * Sending the label as the id fails with `LLM(<label>) is not loaded`, which is
- * exactly what this plugin used to do for `hy3-preview` — that id does not
- * exist; it is a label for `hunyuan-t1`, and upstream answers 401 for it.
- *
- * So: `id` is what goes on the wire, `name` is what the user reads.
- */
-/**
- * What OrcaTerm actually serves, and what to call it.
- *
- * Two things this table has to get right, both measured against the live
- * endpoint on 2026-10-27 rather than assumed:
- *
- * 1. The id is not the label. The client's own model table keeps `newModelId`
- *    (what goes on the wire) apart from `modelName` (what the picker shows).
- *
- * 2. The id is namespaced. The models the desktop picker lists are addressed as
- *    `TokenHub/<model>` or `Hunyuan3/<model>`. Sending the bare name
- *    (`glm-5.3`) answers `LLM(glm-5.3) is not loaded`; `TokenHub/glm-5.3`
- *    answers. That prefix is the whole difference — without it these nine look
- *    unavailable.
- *
- * Measured: all nine picker models answer with this account. The older ids
- * (`deepseek-chat-latest`, `glm-4.7`, `kimi-k2`, `hunyuan-t1`, `hunyuan-turbos`,
- * `qwen3`, …) answer too and stay below as extras, with the ones that duplicate a
- * picker entry kept only as aliases. `hy3`, `hy3-preview`, `hunyuan-standard`,
- * `hunyuan-lite` and `hunyuan-a13b` answer 401 for this account, so they are
- * deliberately absent: listing a model that refuses every call is worse than
- * leaving it out.
- */
-const MODEL_SPECS = [
-  // ---- the desktop picker's nine, labelled as it labels them ---------------
-  {
-    id: "TokenHub/deepseek-v4-pro",
-    name: "Deepseek-V4-Pro",
-    reasoning: true,
-    context: 128000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["Deepseek-V4-Pro", "deepseek-v4-pro", "deepseek-chat-latest", "deepseek-chat", "deepseek", "deepseek-v4"],
-  },
-  {
-    id: "TokenHub/deepseek-v4-flash",
-    name: "DeepSeek-V4-Flash",
-    reasoning: false,
-    context: 128000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["DeepSeek-V4-Flash", "deepseek-v4-flash", "deepseek-flash"],
-  },
-  {
-    id: "TokenHub/deepseek-v4.1-flash",
-    name: "DeepSeek-V4.1-Flash",
-    reasoning: false,
-    context: 128000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["DeepSeek-V4.1-Flash", "deepseek-v4.1-flash"],
-  },
-  {
-    id: "TokenHub/glm-5.3",
-    name: "GLM-5.3",
-    reasoning: true,
-    context: 200000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["GLM-5.3", "glm-5.3", "glm"],
-  },
-  {
-    id: "TokenHub/glm-5.3-flash",
-    name: "GLM-5.3-Flash",
-    reasoning: false,
-    context: 200000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["GLM-5.3-Flash", "glm-5.3-flash"],
-  },
-  {
-    id: "TokenHub/glm-5.2",
-    name: "GLM-5.2",
-    reasoning: false,
-    context: 200000,
-    output: 32000,
-    tool_call: false,
-    // the older glm-4.7 is the same entry under its previous id
-    aliases: ["GLM-5.2", "glm-5.2", "glm-4.7", "bigmodel"],
-  },
-  {
-    id: "TokenHub/kimi-k3",
-    name: "Kimi-K3",
-    reasoning: false,
-    context: 256000,
-    output: 32000,
-    tool_call: false,
-    // the picker used to label this entry "Kimi-k2.6" with id kimi-k2
-    aliases: ["Kimi-K3", "kimi-k3", "kimi", "kimi-k2", "kimi-k2.6", "Kimi-k2.6", "moonshot"],
-  },
-  {
-    id: "Hunyuan3/hy3",
-    name: "Hy3",
-    reasoning: true,
-    context: 256000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["Hy3", "hy3", "hy3-preview", "Hy3-preview", "hunyuan", "hunyuan-t1", "hunyuan-3"],
-  },
-  {
-    id: "Hunyuan3/hy4-preview",
-    name: "Hy4-preview",
-    reasoning: true,
-    context: 256000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["Hy4-preview", "hy4-preview", "hy4", "hunyuan4"],
-  },
-
-  // ---- also served, and worth offering ------------------------------------
-  {
-    id: "glm-4.7-thinking",
-    name: "GLM-5.2 Thinking",
-    reasoning: true,
-    context: 200000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["glm-thinking", "glm-5.2-thinking", "GLM-5.2-Thinking"],
-  },
-  {
-    id: "kimi-k2-thinking",
-    name: "Kimi-k2.6 Thinking",
-    reasoning: true,
-    context: 256000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["kimi-thinking", "Kimi-k2.6-Thinking"],
-  },
-  {
-    id: "kimi-k2.5",
-    name: "Kimi-k2.5",
-    reasoning: false,
-    context: 256000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["Kimi-k2.5"],
-  },
-  {
-    id: "kimi-k2.5-thinking",
-    name: "Kimi-k2.5 Thinking",
-    reasoning: true,
-    context: 256000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["Kimi-k2.5-Thinking"],
-  },
-  {
-    id: "kimi-latest",
-    name: "Kimi Latest",
-    reasoning: false,
-    context: 256000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["Kimi-Latest"],
-  },
-  {
-    id: "hunyuan-turbos",
-    name: "Hunyuan-TurboS",
-    reasoning: false,
-    context: 128000,
-    output: 16000,
-    tool_call: false,
-    aliases: ["Hunyuan-TurboS", "turbos"],
-  },
-  {
-    id: "qwen3",
-    name: "Qwen3",
-    reasoning: false,
-    context: 128000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["Qwen3", "qwen"],
-  },
-  {
-    id: "deepseek-reasoner",
-    name: "DeepSeek Reasoner",
-    reasoning: true,
-    context: 128000,
-    output: 32000,
-    tool_call: false,
-    aliases: ["DeepSeek-Reasoner", "deepseek-r1"],
-  },
-]
-
-/**
- * A sliding-window pacer for upstream's per-account chat limit.
- *
- * Measured behaviour (2026-10-27, and confirmed by another OrcaTerm plugin's
- * notes): ten chats a minute per account. The eleventh is refused with HTTP 200
- * and a JSON body `{"code":429,"message":"Rate limit exceeded: chat-rpm"}` —
- * not an SSE error frame, so a client that only reads `[ERROR]` sees a blank
- * answer instead of a reason.
- *
- * Pacing here is deliberately conservative: `wait()` holds a request until the
- * window has room, and `penalize()` pushes the window out when a 429 does slip
- * through (another client on the same account, or a clock skew).
- */
-function createPacer({ limit = 10, windowMs = 60000, useEnv = true } = {}) {
-  /** When each recent chat was sent. */
-  const sent = []
-  /** No request may go before this time after a 429. */
-  let blockedUntil = 0
-
-  // Read at call time, not construction time: the budget is per account and the
-  // operator may want to leave room for the desktop client, and the test suite
-  // sends far more than ten requests in a row.
-  const budget = () => {
-    if (!useEnv) return limit
-    const n = Number(process.env.ORCATERM_CHAT_RPM)
-    return Number.isFinite(n) && n > 0 ? n : limit
-  }
-
-  const prune = (now) => {
-    while (sent.length && now - sent[0] >= windowMs) sent.shift()
-  }
-
-  return {
-    async wait(signal) {
-      // A test suite (or an operator driving the plugin from a script) can turn
-      // the pacer off wholesale: it is a courtesy to the account's budget, not
-      // a correctness requirement.
-      if (process.env.ORCATERM_NO_PACE) return
-      for (;;) {
-        if (signal?.aborted) return
-        const now = Date.now()
-        prune(now)
-        if (now < blockedUntil) {
-          await sleep(Math.min(blockedUntil - now, 5000))
-          continue
-        }
-        if (sent.length < budget()) {
-          sent.push(now)
-          return
-        }
-        // the oldest must fall out of the window before another may go
-        const waitFor = Math.max(50, windowMs - (now - sent[0]) + 5)
-        await sleep(Math.min(waitFor, 5000))
-      }
-    },
-    /** A 429 came back: hold everything for a window rather than retry into it. */
-    penalize(ms = 15000) {
-      if (process.env.ORCATERM_NO_PACE) return
-      blockedUntil = Math.max(blockedUntil, Date.now() + ms)
-    },
-    /** How many are counted right now (for tests). */
-    size() {
-      prune(Date.now())
-      return sent.length
-    },
-  }
-}
-
-const chatPacer = createPacer()
-
-/** Wait `ms`, but stop early if the caller goes away. */
-function sleep(ms, signal) {
-  return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms)
-    if (signal?.addEventListener) {
-      signal.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(t)
-          resolve()
-        },
-        { once: true },
-      )
-    }
-  })
-}
-
-const ALIAS_TO_ID = (() => {
-  const m = new Map()
-  for (const spec of MODEL_SPECS) {
-    m.set(spec.id.toLowerCase(), spec.id)
-    for (const a of spec.aliases) m.set(a.toLowerCase(), spec.id)
-  }
-  return m
-})()
-
-// ---- small helpers ----------------------------------------------------------
-function uid(prefix = "") {
-  return prefix + randomBytes(12).toString("hex")
-}
-
-/**
- * The id the web client puts in `input.id` — a plain uuid v4, 36 characters
- * with hyphens (module 73383's `Ub` is uuid v4, bundle 2026-10).
- *
- * This has to match, not merely be unique. Upstream rejected the ids this
- * plugin used to make (`in-` + 24 hex) with `Invalid inputId`, and the bundle
- * shows nothing that registers an input before `/chat`, so upstream is
- * reading the shape of the id itself.
- */
-function inputId() {
-  // BY HG OF Robot-XZC
-  return randomUUID()
-}
-
-/** Tencent's skey-style csrf: djb2 of the cookie's skey, & 0x7fffffff */
-function csrfCode(skey) {
-  if (!skey) return ""
-  let h = 5381
-  for (let i = 0; i < skey.length; i++) h = ((h << 5) + h + skey.charCodeAt(i)) | 0
-  return String(h & 0x7fffffff)
-}
-
-function parseTicket(raw) {
-  const text = String(raw ?? "").trim()
-  if (!text) return null
-  const out = { uin: "", skey: "", p_skey: "", p_uin: "", raw: "" }
-
-  if (text.includes("=") && text.includes(";")) {
-    out.raw = text
-    for (const part of text.split(";")) {
-      const eq = part.indexOf("=")
-      if (eq < 0) continue
-      const k = part.slice(0, eq).trim()
-      const v = part.slice(eq + 1).trim()
-      if (k === "uin" || k === "p_uin") out[k] = v
-      else if (k === "skey" || k === "p_skey") out[k] = v
-    }
-  } else if (text.includes("=")) {
-    // a single k=v, or k=v&k=v
-    const pairs = text.split(/[&\s]+/)
-    const obj = {}
-    for (const p of pairs) {
-      const eq = p.indexOf("=")
-      if (eq > 0) obj[p.slice(0, eq).trim()] = p.slice(eq + 1).trim()
-    }
-    if (obj.skey || obj.p_skey || obj.uin || obj.p_uin) {
-      Object.assign(out, {
-        uin: obj.uin || obj.p_uin || "",
-        skey: obj.skey || "",
-        p_skey: obj.p_skey || obj.skey || "",
-        p_uin: obj.p_uin || obj.uin || "",
-      })
-      out.raw = text
-    } else {
-      // one value alone: treat it as the skey
-      out.skey = text
-    }
-  } else {
-    out.skey = text
-  }
-
-  if (!out.skey && out.p_skey) out.skey = out.p_skey
-  if (!out.uin && out.p_uin) out.uin = out.p_uin
-  if (!out.skey) return null
-  if (!out.raw) {
-    out.raw = [out.uin && `uin=${out.uin}`, `skey=${out.skey}`].filter(Boolean).join("; ")
-  }
-  return out
-}
-
-/**
- * The cookie header upstream accepts.
- *
- * Measured (2026-10-26, lightai gateway):
- *   - skey alone          → NEED_UIN_AND_SKEY
- *   - p_uin+p_skey alone  → NEED_UIN_AND_SKEY
- *   - uin + skey          → VERIFY_SKEY_UIN_FAILED (it reaches the verify layer;
- *                           fake credentials stop there)
- *   - uin with or without the o prefix → both accepted
- * So uin and skey must be a pair, and both real: no placeholder uin is derived
- * here any more.
- */
-function cookieHeader(auth) {
-  const t = auth?.ticket
-  if (!t?.skey || !t?.uin) return ""
-  const parts = [`uin=${t.uin}`, `skey=${t.skey}`]
-  if (t.p_skey) parts.push(`p_skey=${t.p_skey}`)
-  if (t.p_uin) parts.push(`p_uin=${t.p_uin}`)
-  return parts.join("; ")
-}
-
-function fingerprint(auth) {
-  // account identity: a WeChat access token carries a userId; a console session
-  // is identified by uin + the first 12 characters of skey
-  const bearer = bearerOf(auth)
-  if (bearer) return `wechat:${readTokenClaims(bearer).userId || bearer.slice(-12)}`
-  const t = auth?.ticket
-  const uin = t?.uin || t?.p_uin || ""
-  return `${uin}:${String(t?.skey ?? "").slice(0, 12)}`
-}
-
-/**
- * The WeChat OAuth access token, when this account was signed in by scanning.
- *
- * Two credentials can drive upstream and they are not interchangeable:
- *   - `uin` + `skey` — the console session cookie; full account authority.
- *   - a WeChat OAuth access token — a 1024-character JWT, two hours, refreshable,
- *     and confined to this product. Measured 2026-10-27: it drives
- *     `/assistant/chat` fine, namespaced models included.
- * The token is recognised by its shape, so a pasted one works without metadata.
- */
-function bearerOf(auth) {
-  const candidates = [auth?.key, auth?.access, auth?.metadata?.accessToken, auth?.ticket?.raw]
-  for (const c of candidates) {
-    const s = String(c ?? "").trim()
-    if (looksLikeAccessToken(s)) return s
-  }
-  return ""
-}
-
-/** OrcaTerm 网页 OAuth 入口（纯前端跳转，不需要凭据；2026-10 实测只支持 wechat） */
 const OAUTH_ORIGIN = "https://orcaterm.com"
 const OAUTH_PROVIDER = "wechat"
 
@@ -496,52 +49,6 @@ function loginUrl(provider = OAUTH_PROVIDER, returnUrl = "https://orcaterm.cloud
   u.searchParams.set("return_url", returnUrl)
   return u.toString()
 }
-function baseHeaders(extra = {}) {
-  return {
-    accept: "text/event-stream",
-    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "content-type": "application/json",
-    origin: CAPI_ORIGIN,
-    referer: `${WEB_TERMINAL}`,
-    "user-agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    ...extra,
-  }
-}
-
-/**
- * magpie's docs: init.body is a JSON string, **or bytes when it isn't UTF-8
- * text**. This folds the shapes (string / Uint8Array / ArrayBuffer / any object
- * that isn't a readable stream) into text.
- */
-function bodyToText(body) {
-  if (body == null) return ""
-  if (typeof body === "string") return body
-  if (body instanceof Uint8Array) return new TextDecoder().decode(body)
-  if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body))
-  if (ArrayBuffer.isView(body)) return new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength))
-  if (typeof body === "object") {
-    // URLSearchParams and the like
-    if (typeof body.toString === "function" && body.constructor?.name !== "Object") return String(body)
-    try {
-      return JSON.stringify(body)
-    } catch {
-      return ""
-    }
-  }
-  return String(body)
-}
-
-/**
- * 后台启动 login.mjs，立刻返回一个「句柄」，而不是等它跑完。
- *
- * 关键：authorize() 必须马上返回 url，magpie 才能打开浏览器；
- * 如果在这里 await 整个登录（最长 300s），就变成：
- *   authorize 等用户扫码 → 用户等浏览器打开 → 浏览器要等 authorize 返回 url
- * 三方互等，magpie 端就一直显示「登录未完成」。
- *
- * 所以：这里只负责把脚本拉起来并返回 wait()，真正的等待放到 callback()。
- */
 function startLoginScript({ timeoutSec = 300, extraArgs = [] } = {}) {
   let scriptPath
   try {
@@ -699,6 +206,505 @@ function readLoginResult(file) {
 }
 
 
+const PROVIDER = "orcaterm"
+
+// ---- upstream constants (the only place to change them) ---------------------
+const ASSISTANT_BASE = "https://lightai.cloud.tencent.com/assistant"
+const CAPI_ORIGIN = "https://orcaterm.cloud.tencent.com"
+const CAPI_URL = "https://api.orcaterm.cloud.tencent.com/cgi/api"
+const WEB_TERMINAL = "https://orcaterm.cloud.tencent.com/terminal"
+
+/** OrcaTerm's built-in assistants (lighthouse/orcaterm/cvm...): which script and tool set runs */
+const ASSISTANT = {
+  orcaterm: "orcaterm",
+  lighthouse: "lighthouse",
+}
+/** 0=RE_ACT 1=PLAN_ACT 2=AUTO_ACT */
+const MODE = { react: 0, planact: 1, autoact: 2 }
+
+/**
+ * Upstream model ids (the frontend's bt.* constants, 2026-10 snapshot).
+ *
+ * `id` is what actually goes into the request body as the model; `name` is only
+ * shown in the picker, so it has to match the id — earlier the marketing names
+ * on the UI (DeepSeek-V4-Pro, GLM-5.2, Kimi-k2.6) were taken for model names.
+ * Those were guessed from interface copy, with nothing behind them, and they
+ * don't match what the server actually serves.
+ *
+ * The context and output caps are estimates too: upstream never publishes a
+ * window size for a model.
+ */
+/**
+ * What OrcaTerm actually serves, and what to call it.
+ *
+ * The desktop client's own table keeps two fields apart, and that is the trap
+ * here: `newModelId` is the id sent upstream, `modelName` is the label its
+ * picker shows. They are not the same string, and the ids carry a namespace — so
+ * the wire id is `TokenHub/glm-5.3` or `Hunyuan3/hy3`, not `glm-5.3`. Sent bare,
+ * upstream answers `LLM(glm-5.3) is not loaded`.
+ *
+ * `id` is what goes on the wire; `name` is what the user reads. Older ids stay in
+ * `aliases` so a config written against them keeps resolving.
+ *
+ * `listed: false` keeps an id resolvable but out of `provider.models`: the README
+ * says not to use those, because they answer on the endpoint yet cannot be
+ * selected in OrcaTerm's own picker, so calling them goes around the product's
+ * interface. They stay only so an existing config does not break.
+ */
+const MODEL_SPECS = [
+  // ---- the desktop picker's nine, labelled as it labels them ---------------
+  {
+    id: "TokenHub/deepseek-v4-pro",
+    name: "Deepseek-V4-Pro",
+    reasoning: true,
+    context: 128000,
+    output: 32000,
+    tool_call: false,
+    aliases: ["Deepseek-V4-Pro", "deepseek-v4-pro", "deepseek-chat-latest", "deepseek-chat", "deepseek", "deepseek-v4"],
+  },
+  {
+    id: "TokenHub/deepseek-v4-flash",
+    name: "DeepSeek-V4-Flash",
+    reasoning: false,
+    context: 128000,
+    output: 32000,
+    tool_call: false,
+    aliases: ["DeepSeek-V4-Flash", "deepseek-v4-flash", "deepseek-flash"],
+  },
+  {
+    id: "TokenHub/deepseek-v4.1-flash",
+    name: "DeepSeek-V4.1-Flash",
+    reasoning: false,
+    context: 128000,
+    output: 32000,
+    tool_call: false,
+    aliases: ["DeepSeek-V4.1-Flash", "deepseek-v4.1-flash"],
+  },
+  {
+    id: "TokenHub/glm-5.3",
+    name: "GLM-5.3",
+    reasoning: true,
+    context: 200000,
+    output: 32000,
+    tool_call: false,
+    aliases: ["GLM-5.3", "glm-5.3", "glm"],
+  },
+  {
+    id: "TokenHub/glm-5.3-flash",
+    name: "GLM-5.3-Flash",
+    reasoning: false,
+    context: 200000,
+    output: 32000,
+    tool_call: false,
+    aliases: ["GLM-5.3-Flash", "glm-5.3-flash"],
+  },
+  {
+    id: "TokenHub/glm-5.2",
+    name: "GLM-5.2",
+    reasoning: false,
+    context: 200000,
+    output: 32000,
+    tool_call: false,
+    // the older glm-4.7 is the same entry under its previous id
+    aliases: ["GLM-5.2", "glm-5.2", "glm-4.7", "bigmodel"],
+  },
+  {
+    id: "TokenHub/kimi-k3",
+    name: "Kimi-K3",
+    reasoning: false,
+    context: 256000,
+    output: 32000,
+    tool_call: false,
+    // the picker used to label this entry "Kimi-k2.6" with id kimi-k2
+    aliases: ["Kimi-K3", "kimi-k3", "kimi", "kimi-k2", "kimi-k2.6", "Kimi-k2.6", "moonshot"],
+  },
+  {
+    id: "Hunyuan3/hy3",
+    name: "Hy3",
+    reasoning: true,
+    context: 256000,
+    output: 32000,
+    tool_call: false,
+    aliases: ["Hy3", "hy3", "hy3-preview", "Hy3-preview", "hunyuan", "hunyuan-t1", "hunyuan-3"],
+  },
+  {
+    id: "Hunyuan3/hy4-preview",
+    name: "Hy4-preview",
+    reasoning: true,
+    context: 256000,
+    output: 32000,
+    tool_call: false,
+    aliases: ["Hy4-preview", "hy4-preview", "hy4", "hunyuan4"],
+  },
+
+  // ---- also served, and worth offering ------------------------------------
+  {
+    id: "glm-4.7-thinking",
+    name: "GLM-5.2 Thinking",
+    reasoning: true,
+    context: 200000,
+    output: 32000,
+    tool_call: false,
+    listed: false,
+    aliases: ["glm-thinking", "glm-5.2-thinking", "GLM-5.2-Thinking"],
+  },
+  {
+    id: "kimi-k2-thinking",
+    name: "Kimi-k2.6 Thinking",
+    reasoning: true,
+    context: 256000,
+    output: 32000,
+    tool_call: false,
+    listed: false,
+    aliases: ["kimi-thinking", "Kimi-k2.6-Thinking"],
+  },
+  {
+    id: "kimi-k2.5",
+    name: "Kimi-k2.5",
+    reasoning: false,
+    context: 256000,
+    output: 32000,
+    tool_call: false,
+    listed: false,
+    aliases: ["Kimi-k2.5"],
+  },
+  {
+    id: "kimi-k2.5-thinking",
+    name: "Kimi-k2.5 Thinking",
+    reasoning: true,
+    context: 256000,
+    output: 32000,
+    tool_call: false,
+    listed: false,
+    aliases: ["Kimi-k2.5-Thinking"],
+  },
+  {
+    id: "kimi-latest",
+    name: "Kimi Latest",
+    reasoning: false,
+    context: 256000,
+    output: 32000,
+    tool_call: false,
+    listed: false,
+    aliases: ["Kimi-Latest"],
+  },
+  {
+    id: "hunyuan-turbos",
+    name: "Hunyuan-TurboS",
+    reasoning: false,
+    context: 128000,
+    output: 16000,
+    tool_call: false,
+    listed: false,
+    aliases: ["Hunyuan-TurboS", "turbos"],
+  },
+  {
+    id: "qwen3",
+    name: "Qwen3",
+    reasoning: false,
+    context: 128000,
+    output: 32000,
+    tool_call: false,
+    listed: false,
+    aliases: ["Qwen3", "qwen"],
+  },
+  {
+    id: "deepseek-reasoner",
+    name: "DeepSeek Reasoner",
+    reasoning: true,
+    context: 128000,
+    output: 32000,
+    tool_call: false,
+    listed: false,
+    aliases: ["DeepSeek-Reasoner", "deepseek-r1"],
+  },
+]
+
+function createPacer({ limit = 10, windowMs = 60000, useEnv = true } = {}) {
+  /** When each recent chat was sent. */
+  const sent = []
+  /** No request may go before this time after a 429. */
+  let blockedUntil = 0
+
+  // Read at call time, not construction time: the budget is per account and the
+  // operator may want to leave room for the desktop client, and the test suite
+  // sends far more than ten requests in a row.
+  const budget = () => {
+    if (!useEnv) return limit
+    const n = Number(process.env.ORCATERM_CHAT_RPM)
+    return Number.isFinite(n) && n > 0 ? n : limit
+  }
+
+  const prune = (now) => {
+    while (sent.length && now - sent[0] >= windowMs) sent.shift()
+  }
+
+  return {
+    async wait(signal) {
+      // A test suite (or a script driving the plugin) can turn the pacer off
+      // wholesale: it is a courtesy to the account budget, not a correctness rule.
+      if (process.env.ORCATERM_NO_PACE) return
+      for (;;) {
+        if (signal?.aborted) return
+        const now = Date.now()
+        prune(now)
+        if (now < blockedUntil) {
+          await sleep(Math.min(blockedUntil - now, 5000), signal)
+          continue
+        }
+        if (sent.length < budget()) {
+          sent.push(now)
+          return
+        }
+        // the oldest must fall out of the window before another may go
+        const waitFor = Math.max(50, windowMs - (now - sent[0]) + 5)
+        await sleep(Math.min(waitFor, 5000), signal)
+      }
+    },
+    /** A 429 came back: hold everything for a window rather than retry into it. */
+    penalize(ms = 15000) {
+      if (process.env.ORCATERM_NO_PACE) return
+      blockedUntil = Math.max(blockedUntil, Date.now() + ms)
+    },
+    /** How long this pacer is holding requests back (for tests). */
+    blockedForTest() {
+      return Math.max(0, blockedUntil - Date.now())
+    },
+    /** How many are counted right now (for tests). */
+    size() {
+      prune(Date.now())
+      return sent.length
+    },
+  }
+}
+
+/**
+ * One pacer per account, not one for the whole module.
+ *
+ * The limit is per account upstream, so a shared instance would make one
+ * account's sends — and its 429 cool-down — hold up every other account magpie
+ * has signed in. Keyed by `fingerprint(auth)`, which is the same identity the
+ * conversation and the account card use.
+ */
+const pacers = new Map()
+
+function pacerFor(auth) {
+  const key = fingerprint(auth)
+  let p = pacers.get(key)
+  if (!p) {
+    // Bound the map the way the session map is bounded. Evict the oldest entry
+    // rather than clearing: `clear()` would also drop live cool-downs, handing
+    // every account a fresh budget the moment the map filled up.
+    if (pacers.size >= 64) {
+      const oldest = pacers.keys().next().value
+      if (oldest !== undefined) pacers.delete(oldest)
+    }
+    p = createPacer()
+    pacers.set(key, p)
+  }
+  return p
+}
+
+/**
+ * Wait `ms`, but stop early if the caller goes away.
+ *
+ * The abort listener is removed when the timeout wins, so a long-lived signal
+ * does not accumulate listeners across waits; and an already-aborted signal
+ * resolves at once instead of waiting the full time.
+ */
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      signal?.removeEventListener?.("abort", finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, ms)
+    signal?.addEventListener?.("abort", finish, { once: true })
+  })
+}
+
+const ALIAS_TO_ID = (() => {
+  const m = new Map()
+  for (const spec of MODEL_SPECS) {
+    m.set(spec.id.toLowerCase(), spec.id)
+    for (const a of spec.aliases) m.set(a.toLowerCase(), spec.id)
+  }
+  return m
+})()
+
+// ---- small helpers ----------------------------------------------------------
+function uid(prefix = "") {
+  return prefix + randomBytes(12).toString("hex")
+}
+
+/**
+ * The id the web client puts in `input.id` — a plain uuid v4, 36 characters with
+ * hyphens (module 73383's `Ub` is uuid v4, bundle 2026-10).
+ *
+ * This has to match, not merely be unique. Upstream rejected the ids this plugin
+ * used to make (`in-` + 24 hex) with `Invalid inputId`, and the bundle shows
+ * nothing that registers an input before `/chat`, so upstream is reading the
+ * shape of the id itself.
+ */
+function inputId() {
+  return randomUUID()
+}
+
+/** Tencent's skey-style csrf: djb2 of the cookie's skey, & 0x7fffffff */
+function csrfCode(skey) {
+  if (!skey) return ""
+  let h = 5381
+  for (let i = 0; i < skey.length; i++) h = ((h << 5) + h + skey.charCodeAt(i)) | 0
+  return String(h & 0x7fffffff)
+}
+
+function parseTicket(raw) {
+  const text = String(raw ?? "").trim()
+  if (!text) return null
+  const out = { uin: "", skey: "", p_skey: "", p_uin: "", raw: "" }
+
+  if (text.includes("=") && text.includes(";")) {
+    out.raw = text
+    for (const part of text.split(";")) {
+      const eq = part.indexOf("=")
+      if (eq < 0) continue
+      const k = part.slice(0, eq).trim()
+      const v = part.slice(eq + 1).trim()
+      if (k === "uin" || k === "p_uin") out[k] = v
+      else if (k === "skey" || k === "p_skey") out[k] = v
+    }
+  } else if (text.includes("=")) {
+    // a single k=v, or k=v&k=v
+    const pairs = text.split(/[&\s]+/)
+    const obj = {}
+    for (const p of pairs) {
+      const eq = p.indexOf("=")
+      if (eq > 0) obj[p.slice(0, eq).trim()] = p.slice(eq + 1).trim()
+    }
+    if (obj.skey || obj.p_skey || obj.uin || obj.p_uin) {
+      Object.assign(out, {
+        uin: obj.uin || obj.p_uin || "",
+        skey: obj.skey || "",
+        p_skey: obj.p_skey || obj.skey || "",
+        p_uin: obj.p_uin || obj.uin || "",
+      })
+      out.raw = text
+    } else {
+      // one value alone: treat it as the skey
+      out.skey = text
+    }
+  } else {
+    out.skey = text
+  }
+
+  if (!out.skey && out.p_skey) out.skey = out.p_skey
+  if (!out.uin && out.p_uin) out.uin = out.p_uin
+  if (!out.skey) return null
+  if (!out.raw) {
+    out.raw = [out.uin && `uin=${out.uin}`, `skey=${out.skey}`].filter(Boolean).join("; ")
+  }
+  return out
+}
+
+/**
+ * The cookie header upstream accepts.
+ *
+ * Measured (2026-10-26, lightai gateway):
+ *   - skey alone          → NEED_UIN_AND_SKEY
+ *   - p_uin+p_skey alone  → NEED_UIN_AND_SKEY
+ *   - uin + skey          → VERIFY_SKEY_UIN_FAILED (it reaches the verify layer;
+ *                           fake credentials stop there)
+ *   - uin with or without the o prefix → both accepted
+ * So uin and skey must be a pair, and both real: no placeholder uin is derived
+ * here any more.
+ */
+function cookieHeader(auth) {
+  const t = auth?.ticket
+  if (!t?.skey || !t?.uin) return ""
+  const parts = [`uin=${t.uin}`, `skey=${t.skey}`]
+  if (t.p_skey) parts.push(`p_skey=${t.p_skey}`)
+  if (t.p_uin) parts.push(`p_uin=${t.p_uin}`)
+  return parts.join("; ")
+}
+
+function fingerprint(auth) {
+  // Account identity: a WeChat access token carries a userId; a console session
+  // is uin + the first 12 characters of skey.
+  //
+  // The fallback is deliberately a constant, not a slice of the token: a token
+  // without a `userId` claim is replaced on every renewal, and keying on its
+  // tail would hand that account a brand-new pacer — and a brand-new budget —
+  // every two hours. One shared fallback key is the conservative choice.
+  const bearer = bearerOf(auth)
+  if (bearer) return `wechat:${readTokenClaims(bearer).userId || "unknown"}`
+  const t = auth?.ticket
+  const uin = t?.uin || t?.p_uin || ""
+  return `${uin}:${String(t?.skey ?? "").slice(0, 12)}`
+}
+
+/**
+ * The WeChat OAuth access token, when this account signed in by scanning.
+ *
+ * Two credentials can drive upstream and they are not interchangeable:
+ *   - `uin` + `skey` — the console session cookie; full account authority.
+ *   - a WeChat OAuth access token — a 1024-character JWT, two hours, renewable,
+ *     confined to this product. Measured 2026-10-27: it drives /assistant/chat
+ *     fine, namespaced model ids included.
+ * Recognised by shape, so a pasted token works without any metadata.
+ */
+function bearerOf(auth) {
+  const candidates = [auth?.key, auth?.access, auth?.metadata?.accessToken, auth?.ticket?.raw]
+  for (const c of candidates) {
+    const s = String(c ?? "").trim()
+    if (looksLikeAccessToken(s)) return s
+  }
+  return ""
+}
+
+function baseHeaders(extra = {}) {
+  return {
+    accept: "text/event-stream",
+    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "content-type": "application/json",
+    origin: CAPI_ORIGIN,
+    referer: `${WEB_TERMINAL}`,
+    "user-agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    ...extra,
+  }
+}
+
+/**
+ * magpie's docs: init.body is a JSON string, **or bytes when it isn't UTF-8
+ * text**. This folds the shapes (string / Uint8Array / ArrayBuffer / any object
+ * that isn't a readable stream) into text.
+ */
+function bodyToText(body) {
+  if (body == null) return ""
+  if (typeof body === "string") return body
+  if (body instanceof Uint8Array) return new TextDecoder().decode(body)
+  if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body))
+  if (ArrayBuffer.isView(body)) return new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength))
+  if (typeof body === "object") {
+    // URLSearchParams and the like
+    if (typeof body.toString === "function" && body.constructor?.name !== "Object") return String(body)
+    try {
+      return JSON.stringify(body)
+    } catch {
+      return ""
+    }
+  }
+  return String(body)
+}
+
 // ---- model resolution -------------------------------------------------------
 function resolveModel(requested) {
   const raw = String(requested ?? "").trim()
@@ -734,7 +740,7 @@ function toUpstreamBody(body, { conversationId, userId }) {
         .map((part) => {
           if (typeof part === "string") return part
           if (part?.type === "text") return part.text ?? ""
-          if (part?.type === "image_url") return "[图片]"
+          if (part?.type === "image_url") return "[image]"
           return ""
         })
         .filter(Boolean)
@@ -752,7 +758,7 @@ function toUpstreamBody(body, { conversationId, userId }) {
     }
     if (role === "tool") {
       const t = textOf(msg.content).trim()
-      if (t) turns.push({ role: "user", content: `[工具结果 ${msg.tool_call_id ?? ""}]\n${t}` })
+      if (t) turns.push({ role: "user", content: `[tool result ${msg.tool_call_id ?? ""}]\n${t}` })
       continue
     }
     if (role === "assistant") {
@@ -763,7 +769,7 @@ function toUpstreamBody(body, { conversationId, userId }) {
         const desc = calls
           .map((c) => `${c?.function?.name ?? "tool"}(${c?.function?.arguments ?? ""})`)
           .join("\n")
-        turns.push({ role: "assistant", content: `[调用工具]\n${desc}` })
+        turns.push({ role: "assistant", content: `[called tool]\n${desc}` })
       }
       continue
     }
@@ -784,22 +790,21 @@ function toUpstreamBody(body, { conversationId, userId }) {
     history.push(...turns.slice(0, -1))
   } else {
     inputText = turns[lastUser].content
+    history.push(...turns.slice(0, lastUser))
     // Only what came before the last user turn is context. An assistant turn
     // after it is the reply the caller wants continued, not something to put in
-    // front of the question — doing that asked the earlier answer as if it were
-    // the conversation's history.
-    history.push(...turns.slice(0, lastUser))
+    // front of the question.
   }
 
   // Nothing goes up as `historyMessages`, and the conversation id can't carry the
   // thread either: magpie hands every request a fresh `sessionID`
   // (`magpie-<random>`, measured 2026-10-27 — four requests, four ids), so each
-  // turn would otherwise reach upstream as a brand-new conversation and the
-  // assistant would forget everything said before it.
+  // turn would otherwise reach upstream as a new conversation and the assistant
+  // would forget everything said before it.
   //
-  // What magpie does give is the whole message list every time. So the earlier
-  // turns travel in the text, as a transcript: that is the one thing a stateless
-  // gateway can rely on.
+  // What magpie does give is the whole message list every time, so the earlier
+  // turns travel in the text as a transcript — the one thing a stateless gateway
+  // can rely on.
   //
   // (`historyMessages` itself was tried: an entry's kind is in `type`, not
   // `role`, and with the wrong field upstream fails inside its own handler with
@@ -809,23 +814,23 @@ function toUpstreamBody(body, { conversationId, userId }) {
 
   const transcript = history
     .filter((t) => (t.content ?? "").trim())
-    .map((t) => (t.role === "assistant" ? `助手：${t.content.trim()}` : `用户：${t.content.trim()}`))
+    .map((t) => (t.role === "assistant" ? `assistant: ${t.content.trim()}` : `user: ${t.content.trim()}`))
   const transcriptPrefix = transcript.length
-    ? `[此前的对话]\n${transcript.join("\n")}\n[此前的对话结束]\n\n`
+    ? `[earlier in this conversation]\n${transcript.join("\n")}\n[end of earlier conversation]\n\n`
     : ""
 
   // Tool traffic has to survive too: with no history on the wire, a tool's
-  // result is invisible to an upstream that keeps its own thread, and dropping
-  // it silently loses what the tool found. It is already part of `transcript`;
-  // this keeps it visible even when it fell outside it.
+  // result is invisible upstream, and dropping it silently loses what the tool
+  // found. It is already part of `transcript`; this keeps it visible when it
+  // fell outside it.
   const toolNotes = history
-    .filter((t) => (t.content ?? "").trim() && /\[(调用工具|工具结果)/.test(t.content))
+    .filter((t) => (t.content ?? "").trim() && /\[(called tool|tool result)/.test(t.content))
     .map((t) => t.content.trim())
     .filter((note) => !transcriptPrefix.includes(note))
   const toolPrefix = toolNotes.length ? `${toolNotes.join("\n")}\n\n` : ""
 
   const prefix = systems.length
-    ? `[系统指令，优先级高于后续对话]\n${systems.join("\n\n")}\n[系统指令结束]\n\n`
+    ? `[system instructions, higher priority than the conversation]\n${systems.join("\n\n")}\n[end of system instructions]\n\n`
     : ""
 
   // Upstream requires input.content to be non-empty: an empty messages list or
@@ -833,8 +838,8 @@ function toUpstreamBody(body, { conversationId, userId }) {
   let content = prefix + transcriptPrefix + toolPrefix + inputText
   if (!content.trim()) {
     content = prefix
-      ? `${prefix}（用户没有提供内容，请简短说明你需要什么信息）`
-      : "（用户没有提供内容，请简短说明你需要什么信息）"
+      ? `${prefix}(no content was given; ask briefly what is needed)`
+      : "(no content was given; ask briefly what is needed)"
   }
 
   return {
@@ -867,9 +872,7 @@ function toUpstreamBody(body, { conversationId, userId }) {
       },
     },
     // The web client's own shape for a first turn: `type: "start"` and the text
-    // in `input.input` — not `content`. Both were needed: `content` is what made
-    // upstream answer "Invalid inputId" for the ids this plugin used to invent,
-    // and `content` on its own never carried the turn kind upstream expects.
+    // in `input.input` — not `content`, and not an invented `in-…` id.
     input: {
       id: inputId(),
       type: "start",
@@ -916,7 +919,7 @@ function parseSseLine(line) {
   if (!payload) return null
   if (payload === "[DONE]") return { done: true }
   if (payload.startsWith("[ERROR]")) {
-    return { error: payload.replace(/^\[ERROR\]:?\s*/, "") || "上游返回错误" }
+    return { error: payload.replace(/^\[ERROR\]:?\s*/, "") || "the upstream returned an error" }
   }
   if (payload.startsWith("[ABORTED]")) return { done: true }
   try {
@@ -956,12 +959,11 @@ function fullToDelta(full, sent) {
   if (full.startsWith(sent)) return full.slice(sent.length)
   return full
 }
-
 /**
  * The trailing action envelope, cut out of an answer that already arrived.
  *
  * Upstream sometimes puts the prose first and the envelope after it, in one
- * answer: `已记住你的名字` followed by a ```` ```json ```` fenced
+ * answer: some prose followed by a ```` ```json ```` fenced
  * `{"action": "completion", "taskCompletion": "…"}`. A streaming reader sees the
  * prose go by before there is any envelope to recognise, so the envelope is
  * removed from the tail instead.
@@ -972,7 +974,7 @@ function fullToDelta(full, sent) {
  */
 function stripTrailingEnvelope(text) {
   const raw = String(text ?? "")
-  const opening = /\{\s*"action"\s*:/g
+  const opening = /\{\s*"action"\s*:/gi
   const starts = []
   let m
   while ((m = opening.exec(raw))) starts.push(m.index)
@@ -990,7 +992,7 @@ function stripTrailingEnvelope(text) {
       .trim()
     try {
       const obj = JSON.parse(tail)
-      if (obj && typeof obj.action === "string") return raw.slice(0, idx)
+      if (isActionEnvelope(obj) && raw.slice(0, idx).trim()) return raw.slice(0, idx)
     } catch {
       /* not a whole object from here; try an earlier opening */
     }
@@ -1036,9 +1038,13 @@ function unwrapAnswer(text) {
     // still arriving, or the model wrote braces that don't parse: leave it be
     return raw
   }
-  if (!obj || typeof obj.action !== "string") return raw
-  if (typeof obj.taskCompletion === "string") return obj.taskCompletion
-  return raw
+  // Key lookup is case-insensitive, the same way `isActionEnvelope` treats the
+  // verb: the assistant writes its own JSON and does not always keep the case.
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return raw
+  const action = obj.action ?? obj.Action
+  if (typeof action !== "string") return raw
+  const completion = obj.taskCompletion ?? obj.TaskCompletion
+  return typeof completion === "string" ? completion : raw
 }
 
 /** JSON string escapes, for reading the envelope's answer as it arrives. */
@@ -1049,7 +1055,7 @@ const JSON_ESCAPES = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n"
  * prose is still recognised. Big enough for `{"action": …` to appear, small
  * enough that a reply starting to stream is not visibly delayed.
  */
-const ENVELOPE_TAIL = 24
+const ENVELOPE_TAIL = 48
 
 /**
  * The answer inside the assistant's action envelope, for a reply that is still
@@ -1075,13 +1081,13 @@ const ENVELOPE_TAIL = 24
 
 /** The `"taskCompletion"` value's opening quote in `s`, or -1 while it hasn't shown up. */
 function answerStart(s) {
-  const i = s.indexOf('"taskCompletion"')
-  if (i < 0) return -1
-  let j = i + '"taskCompletion"'.length
-  while (j < s.length && /\s/.test(s[j])) j += 1
-  if (s[j] !== ":") return -1
-  j += 1
-  while (j < s.length && /\s/.test(s[j])) j += 1
+  // The field name, matched the way the client matches it — case-insensitively —
+  // and with only the small amount of whitespace the assistant actually emits.
+  // It is checked only after the reply has been established to be an envelope,
+  // so a reply that merely quotes the field name is never read as one.
+  const m = /"taskCompletion"\s{0,8}:\s{0,8}/i.exec(s)
+  if (!m) return -1
+  const j = m.index + m[0].length
   if (s[j] !== '"') return -1
   return j + 1
 }
@@ -1133,7 +1139,8 @@ function couldBeEnvelope(s) {
   const rest = t.slice(1).replace(/^\s+/, "")
   if (!rest) return true
   if (rest.startsWith('"')) {
-    const key = rest.slice(1).replace(/^\s+/, "")
+    // compared lowercased, to match how `isActionEnvelope` reads the verb
+    const key = rest.slice(1).replace(/^\s+/, "").toLowerCase()
     if (!key) return true
     if (key.startsWith("action")) return true
     return "action".slice(0, key.length) === key
@@ -1144,22 +1151,104 @@ function couldBeEnvelope(s) {
 /** How a fenced code block may open, as far as it can be judged while arriving. */
 const FENCE_OPENING = "```json\n"
 
-/** How an envelope may begin, as far as the first key goes. */
-const ENVELOPE_OPENING = '{"action":'
+/** The verbs the client's own envelope can carry (module 82025). */
+const ENVELOPE_ACTIONS = new Set(["completion", "ask", "review", "start", "planner", "default"])
 
-/** Where an envelope begins in `s` after some prose, or -1. */
-function appendedEnvelopeAt(s) {
-  const opening = /\{\s*"action"\s*:/g
+/**
+ * Whether a parsed object is the assistant's own action envelope — the message
+ * object its client wraps a reply in — and not merely a JSON object with an
+ * `action` key.
+ *
+ * The distinction matters: a Redux action, or a reducer a user asked the
+ * assistant to write out, has an `action` too, and cutting there truncated the
+ * reply. So a recognised verb has to come with one of the fields the client reads
+ * a reply out of, and an unrecognised verb has to carry `taskCompletion` — the
+ * one field a finished answer is always in. A snippet like
+ * `{"action": "SAVE", "content": "…"}` at the end of an answer is then left
+ * alone, which is what the reviewer's example was about.
+ */
+function isActionEnvelope(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false
+  const action = obj.action ?? obj.Action
+  if (typeof action !== "string") return false
+  const hasPayload =
+    typeof (obj.taskCompletion ?? obj.TaskCompletion) === "string" ||
+    typeof obj.thinking === "string" ||
+    typeof obj.content === "string" ||
+    typeof obj.question === "string"
+  if (ENVELOPE_ACTIONS.has(action.toLowerCase())) return hasPayload
+  return typeof (obj.taskCompletion ?? obj.TaskCompletion) === "string"
+}
+
+/** The last position where an envelope opening starts and is followed by nothing. */
+function envelopeTailAt(s) {
+  const opening = /\{\s*"action"\s*:/gi
+  const starts = []
   let m
-  let at = -1
-  while ((m = opening.exec(s))) {
-    if (m.index > 0) at = m.index
+  while ((m = opening.exec(s))) if (m.index > 0) starts.push(m.index)
+  return starts
+}
+
+/** Where a *complete* trailing envelope begins in `s`, or -1. */
+function appendedEnvelopeAt(s) {
+  const starts = envelopeTailAt(s)
+  for (let k = starts.length - 1; k >= 0; k--) {
+    const at = starts[k]
+    // nothing may follow the object: this is the tail of the reply
+    const tail = s
+      .slice(at)
+      .trim()
+      .replace(/\s*```$/, "")
+      .trim()
+    let obj
+    try {
+      obj = JSON.parse(tail)
+    } catch {
+      continue
+    }
+    if (!isActionEnvelope(obj)) continue
+    // the fence in front of it belongs to the envelope too
+    const before = s.slice(0, at)
+    const fence = before.match(/```(?:json)?\s*$/i)
+    const start = fence ? before.length - fence[0].length : at
+    if (s.slice(0, start).trim()) return start
   }
-  if (at < 0) return -1
-  // the fence in front of it belongs to the envelope too
+  return -1
+}
+
+/**
+ * Where a *still-arriving* envelope begins, or -1.
+ *
+ * While the object is incomplete it cannot be judged, and letting the opening go
+ * out would show `{"action":` as prose. So hold from there — but only while it
+ * cannot be parsed yet: as soon as it parses and is not an envelope, it is
+ * ordinary text and must flow again.
+ */
+function appendedEnvelopePendingAt(s) {
+  const starts = envelopeTailAt(s)
+  // The opening can itself span more than ENVELOPE_TAIL characters (for
+  // example, a pretty-printed object with a long whitespace prefix). Hold
+  // a partial opening before its action key is complete as well.
+  const partial = s.lastIndexOf("{")
+  if (partial > 0 && !starts.includes(partial) && couldBeEnvelope(s.slice(partial))) starts.push(partial)
+  if (!starts.length) return -1
+  const at = starts[starts.length - 1]
+  const tail = s
+    .slice(at)
+    .trim()
+    .replace(/\s*```$/, "")
+    .trim()
+  try {
+    JSON.parse(tail)
+    return -1 // complete, and `appendedEnvelopeAt` already rejected it
+  } catch {
+    /* still arriving */
+  }
+  if (!couldBeEnvelope(tail)) return -1
   const before = s.slice(0, at)
   const fence = before.match(/```(?:json)?\s*$/i)
-  return fence ? before.length - fence[0].length : at
+  const start = fence ? before.length - fence[0].length : at
+  return s.slice(0, start).trim() ? start : -1
 }
 
 function createAnswerExtractor() {
@@ -1169,26 +1258,43 @@ function createAnswerExtractor() {
   let sent = 0
   /** The answer can grow no more. */
   let closed = false
+  /** Nothing more will arrive: stop holding a tail back. */
+  let final = false
 
-  /** What the answer should be, given everything received so far. */
+  /**
+   * What the answer should be, given everything received so far.
+   *
+   * A reply that starts like an envelope is ambiguous until EOF: it can also
+   * be a JSON example followed by prose. Hold that candidate until its complete
+   * shape is known, so decoding it never discards later text. Ordinary prose
+   * and reasoning still stream as they arrive.
+   */
   const answerSoFar = () => {
+    if (couldBeEnvelope(raw)) {
+      if (!final) return ""
+      if (isEnvelope(raw)) return unwrapAnswer(raw)
+      // Preserve the decoded prefix if upstream ended inside the answer string.
+      // A closed string followed by prose is an example, so keep it verbatim.
+      const start = answerStart(raw)
+      if (start >= 0) {
+        const decoded = decodeJsonString(raw.slice(start))
+        if (!decoded.ended) return decoded.text
+      }
+      return stripTrailingEnvelope(raw)
+    }
     const appended = appendedEnvelopeAt(raw)
     if (appended > 0) return raw.slice(0, appended)
-    const start = answerStart(raw)
-    if (start >= 0) {
-      // The envelope's answer has begun. If prose came first, the prose is the
-      // answer and the envelope is bookkeeping — that happens when the fence
-      // opening sits between them.
-      const lead = raw.slice(0, start).replace(/```(?:json)?\s*$/i, "").trim()
-      if (lead && !couldBeEnvelope(lead)) return raw.slice(0, start).replace(/```(?:json)?\s*$/i, "")
-      return decodeJsonString(raw.slice(start)).text
+
+    // A trailing object is still arriving and could be the envelope: hold from
+    // there rather than show `{"action":` as prose. Once it parses and turns out
+    // not to be one, this stops matching and the text flows again.
+    if (!final) {
+      const pending = appendedEnvelopePendingAt(raw)
+      if (pending > 0) return raw.slice(0, pending)
     }
-    // No envelope in the text yet. While it could still be one (the opening is
-    // only half arrived) nothing may be shown, or `{"action"` would go out as
-    // prose; once that's ruled out the reply is plain and its own answer.
-    if (couldBeEnvelope(raw)) return ""
-    // no envelope at all: the reply is the answer, minus a short tail held
-    // back in case an envelope is still to come
+
+    // no envelope at all: the reply is its own answer
+    if (final) return stripTrailingEnvelope(raw)
     return raw.slice(0, Math.max(0, raw.length - ENVELOPE_TAIL))
   }
 
@@ -1205,42 +1311,22 @@ function createAnswerExtractor() {
     push(delta) {
       if (!delta || closed) return ""
       raw += delta
-
-      // prose followed by an envelope: the envelope ends the answer
-      if (appendedEnvelopeAt(raw) > 0) {
-        const out = emit()
-        closed = true
-        return out
-      }
-
-      // an envelope whose answer has finished
-      const start = answerStart(raw)
-      if (start >= 0 && decodeJsonString(raw.slice(start)).ended) {
-        const out = emit()
-        closed = true
-        return out
-      }
-
-      // Still undecided (could be the start of an envelope): hold it. Once it
-      // can't be one, `answerSoFar` is plain prose and this passes it on.
+      // Deliberately never closes here. A complete envelope-shaped object is
+      // only "trailing" as far as what has arrived: if more text follows it, it
+      // was an example inside the answer, not the envelope, and closing early
+      // dropped everything after it. Cutting the *output* is enough — sending
+      // stops at the object — and `finish()` is what ends the stream.
       return emit()
     },
     /** Whatever is held back when the stream ends. */
     finish() {
       if (closed) return ""
+      // Nothing more is coming: judge the whole text as it stands, without
+      // holding a tail back for an envelope that will never arrive.
+      final = true
+      const out = emit()
       closed = true
-      // Nothing more is coming, so a short reply can't be waiting on a tail:
-      // judge the whole text as it stands.
-      if (!isEnvelope(raw)) {
-        const want = stripTrailingEnvelope(raw)
-        if (want.length > sent) {
-          const out = want.slice(sent)
-          sent = want.length
-          return out
-        }
-        return ""
-      }
-      return emit()
+      return out
     },
   }
 }
@@ -1255,7 +1341,7 @@ function isEnvelope(s) {
   if (!t.startsWith("{")) return false
   try {
     const o = JSON.parse(t)
-    return !!o && typeof o.action === "string"
+    return isActionEnvelope(o)
   } catch {
     return false
   }
@@ -1275,7 +1361,7 @@ function isEnvelope(s) {
 const ERROR_MAP = [
   // monthly quota gone: another account is worth trying, so mark it 429 and
   // magpie moves to the next one
-  { re: /quota|exceeded|额度|次数已用完|余额不足/i, status: 429, type: "rate_limit_error" },
+  { re: /quota|额度|次数已用完|余额不足|allowance|insufficient/i, status: 429, type: "rate_limit_error" },
   // rate limited: the same, but it has to wait a while
   { re: /rate.?limit|too many|频繁|限流/i, status: 429, type: "rate_limit_error" },
   // sign-in problem: mark the account as needing to sign in again
@@ -1283,13 +1369,13 @@ const ERROR_MAP = [
 ]
 
 /** Which status to answer with, judged from upstream's error text. */
-function errorStatus(text) {
+function errorStatus(text, pacer) {
   const t = String(text ?? "")
   for (const m of ERROR_MAP) {
     if (m.re.test(t)) {
-      // A rate limit is the one error the plugin can act on: hold the next few
-      // requests back instead of walking straight into the same wall.
-      if (m.status === 429) chatPacer.penalize()
+      // A rate limit is the one error the plugin can act on: hold this account's
+      // next requests back instead of walking straight into the same wall.
+      if (m.status === 429) pacer?.penalize()
       return m
     }
   }
@@ -1300,6 +1386,21 @@ function errorStatus(text) {
 
 /** At most this much of the stream head is read: enough to see whether the first frame is an answer or an error. */
 const SSE_PEEK_LIMIT = 8 * 1024
+
+/** Cancel without waiting for a peer that may keep its socket open. */
+function releaseReader(reader) {
+  if (!reader) return
+  try {
+    void reader.cancel().catch(() => {})
+  } catch {
+    /* already released */
+  }
+  try {
+    reader.releaseLock()
+  } catch {
+    /* a pending read owns the lock until cancellation completes */
+  }
+}
 
 /**
  * Read the stream head until it's clear whether this is an answer or an error —
@@ -1314,25 +1415,30 @@ async function peekAnswer(body) {
   if (!body) return head
   head.reader = body.getReader()
   let done = false
-  for (;;) {
-    const v = classifyHead(head.text, done)
-    if (v) {
-      head.verdict = v
-      break
+  try {
+    for (;;) {
+      const v = classifyHead(head.text, done)
+      if (v) {
+        head.verdict = v
+        break
+      }
+      if (head.text.length >= SSE_PEEK_LIMIT) break
+      const r = await head.reader.read()
+      if (r.done) {
+        done = true
+        continue
+      }
+      head.chunks.push(r.value)
+      head.text += head.decoder.decode(r.value, { stream: true })
     }
-    if (head.text.length >= SSE_PEEK_LIMIT) break
-    const r = await head.reader.read()
-    if (r.done) {
-      done = true
-      continue
-    }
-    head.chunks.push(r.value)
-    head.text += head.decoder.decode(r.value, { stream: true })
+  } catch (err) {
+    releaseReader(head.reader)
+    throw err
   }
   if (head.verdict === "error") {
     // an error stream is dropped outright; cancel isn't awaited, it can hang on
     // a live stream
-    void head.reader.cancel().catch(() => {})
+    releaseReader(head.reader)
   }
   return head
 }
@@ -1343,7 +1449,8 @@ async function peekAnswer(body) {
  * (or an empty one).
  */
 function classifyHead(text, done) {
-  const [lines] = takeSseLines(text)
+  const [lines, rest] = takeSseLines(text)
+  if (done && rest.trim()) lines.push(rest)
   for (const line of lines) {
     const ev = parseSseLine(line)
     if (!ev) continue
@@ -1357,12 +1464,13 @@ function classifyHead(text, done) {
 
 /** Pull upstream's error text out of the stream head already read. */
 function errorCodeFromHead(text) {
-  const [lines] = takeSseLines(text)
+  const [lines, rest] = takeSseLines(text)
+  if (rest.trim()) lines.push(rest)
   for (const line of lines) {
     const ev = parseSseLine(line)
     if (ev?.error) return ev.error
   }
-  return "上游返回了错误"
+  return "the upstream returned an error"
 }
 
 /** Splice the bytes peek read back into the stream, then read the rest. */
@@ -1377,16 +1485,18 @@ function replayBody(head) {
       try {
         const r = await head.reader.read()
         if (r.done) {
+          releaseReader(head.reader)
           controller.close()
           return
         }
         controller.enqueue(r.value)
       } catch (err) {
+        releaseReader(head.reader)
         controller.error(err)
       }
     },
     cancel(reason) {
-      return head.reader.cancel(reason).catch(() => {})
+      releaseReader(head.reader)
     },
   })
 }
@@ -1397,7 +1507,7 @@ function replayBody(head) {
  * out as is; when a frame turns out to carry the cumulative value (longer than
  * what was sent and starting with it), it is converted to an increment.
  */
-function upstreamToOpenAI(upstreamBody, { model }) {
+function upstreamToOpenAI(upstreamBody, { model, pacer }) {
   const encoder = new TextEncoder()
   const id = uid("chatcmpl-")
   const created = Math.floor(Date.now() / 1000)
@@ -1424,12 +1534,7 @@ function upstreamToOpenAI(upstreamBody, { model }) {
       }
       return
     }
-    try {
-      const r = reader.cancel()
-      if (r && typeof r.catch === "function") r.catch(() => {})
-    } catch {
-      /* ignore */
-    }
+    releaseReader(reader)
   }
 
   const chunk = (delta, finish = null, extra = {}) =>
@@ -1448,12 +1553,12 @@ function upstreamToOpenAI(upstreamBody, { model }) {
       const finishUp = (reason = "stop", { skipReasoningFallback = false } = {}) => {
         if (closed) return
         // Whatever the extractor is still holding belongs to the answer, and it
-        // has to go out before the "thinking but no text" fallback decides
-        // there was no text at all.
-        const tail = skipReasoningFallback ? "" : answer.finish()
-        if (tail) {
-          push(chunk({ content: tail }))
-          emitText += tail.length
+        // has to go out before the "thinking but no text" fallback decides there
+        // was no text at all.
+        const held = skipReasoningFallback ? "" : answer.finish()
+        if (held) {
+          push(chunk({ content: held }))
+          emitText += held.length
         }
         // Upstream sent thinking but no text: turn the thinking into text
         // before closing, so the client doesn't show a blank answer.
@@ -1480,6 +1585,36 @@ function upstreamToOpenAI(upstreamBody, { model }) {
       reader = upstreamBody.getReader()
       const decoder = new TextDecoder()
       let buf = ""
+      // A final line without a newline follows exactly the same path as every
+      // complete line, including error classification and account cool-down.
+      const absorb = (line) => {
+        const ev = parseSseLine(line)
+        if (!ev) return
+        if (ev.done) {
+          finishUp("stop")
+          return
+        }
+        if (ev.error) {
+          closed = true
+          const m = errorStatus(ev.error, pacer)
+          controller.error(Object.assign(new Error(`OrcaTerm: ${ev.error}`), { statusCode: m.status }))
+          return
+        }
+        const textDelta = typeof ev.full === "string" ? fullToDelta(ev.full, sentContent) : (ev.content ?? "")
+        if (textDelta) {
+          sentContent += textDelta
+          const visible = answer.push(textDelta)
+          if (visible) {
+            emitText += visible.length
+            push(chunk({ content: visible }))
+          }
+        }
+        const reasonDelta = ev.reasoning ?? ""
+        if (reasonDelta) {
+          sentReasoning += reasonDelta
+          push(chunk({ reasoning_content: reasonDelta }))
+        }
+      }
       try {
         for (;;) {
           const { done, value } = await reader.read()
@@ -1488,69 +1623,15 @@ function upstreamToOpenAI(upstreamBody, { model }) {
           const [lines, rest] = takeSseLines(buf)
           buf = rest
           for (const line of lines) {
-            const ev = parseSseLine(line)
-            if (!ev) continue
-            if (ev.done) {
-              finishUp("stop")
-              return
-            }
-            if (ev.error) {
-              // A failure halfway through the stream: end this stream with an
-              // error instead of sending some text and closing normally. The
-              // latter would let magpie count it as a success — no failover, no
-              // rest for the account.
-              closed = true
-              const m = errorStatus(ev.error)
-              controller.error(Object.assign(new Error(`OrcaTerm: ${ev.error}`), { statusCode: m.status }))
-              releaseUpstream()
-              return
-            }
-
-            // `content` is this frame's increment and is used as is; only
-            // `fullContent` (the whole text so far) has to be converted to an
-            // increment. Treating a content that started with what was already
-            // sent as cumulative and truncating it was wrong: "haha" after "ha"
-            // got cut to "", and the text was lost.
-            const textDelta = typeof ev.full === "string" ? fullToDelta(ev.full, sentContent) : (ev.content ?? "")
-            if (textDelta) {
-              sentContent += textDelta
-              // the answer lives inside the assistant's action envelope; only
-              // the answer itself goes out
-              const visible = answer.push(textDelta)
-              if (visible) {
-                emitText += visible.length
-                push(chunk({ content: visible }))
-              }
-            }
-
-            // thinking works the same way: content-style increments go out as
-            // is, fullContent-style ones get converted
-            let reasonDelta = ev.reasoning ?? ""
-            if (reasonDelta) {
-              sentReasoning += reasonDelta
-              push(chunk({ reasoning_content: reasonDelta }))
-            }
+            absorb(line)
+            if (closed) return
           }
         }
         const [tailLines, tailRest] = takeSseLines(buf)
         const pending = tailRest.trim() ? [...tailLines, tailRest] : tailLines
         for (const line of pending) {
-          const ev = parseSseLine(line)
-          if (!ev || ev.done || ev.error) continue
-          const d = typeof ev.full === "string" ? fullToDelta(ev.full, sentContent) : (ev.content ?? "")
-          if (d) {
-            sentContent += d
-            const visible = answer.push(d)
-            if (visible) {
-              emitText += visible.length
-              push(chunk({ content: visible }))
-            }
-          }
-          const r = ev.reasoning ?? ""
-          if (r) {
-            sentReasoning += r
-            push(chunk({ reasoning_content: r }))
-          }
+          absorb(line)
+          if (closed) return
         }
         finishUp("stop")
       } catch (err) {
@@ -1561,12 +1642,13 @@ function upstreamToOpenAI(upstreamBody, { model }) {
         if (!closed) {
           closed = true
           controller.error(
-            Object.assign(new Error(`OrcaTerm 连接中断：${err?.message ?? err}`), {
+            Object.assign(new Error(`OrcaTerm connection broke: ${err?.message ?? err}`), {
               statusCode: err?.name === "AbortError" ? 499 : 502,
             }),
           )
-          releaseUpstream()
         }
+      } finally {
+        releaseUpstream()
       }
     },
     // cut upstream off the moment the client disconnects (the agent gave up),
@@ -1585,7 +1667,7 @@ function upstreamToOpenAI(upstreamBody, { model }) {
   })
 }
 
-async function upstreamToJSON(upstreamBody, { model }) {
+async function upstreamToJSON(upstreamBody, { model, pacer }) {
   const reader = upstreamBody.getReader()
   const decoder = new TextDecoder()
   let buf = ""
@@ -1595,6 +1677,7 @@ async function upstreamToJSON(upstreamBody, { model }) {
   let sawDone = false
 
   const absorb = (line) => {
+    if (sawDone || upstreamError) return
     const ev = parseSseLine(line)
     if (!ev) return
     if (ev.done) {
@@ -1618,50 +1701,51 @@ async function upstreamToJSON(upstreamBody, { model }) {
     }
   }
 
-  for (;;) {
-    let chunkRead
-    try {
-      chunkRead = await reader.read()
-    } catch (err) {
-      // Client abort / connection lost: answer with a real error status; it
-      // must not be dressed up as an answer. Earlier this returned 200 plus a
-      // "connection lost" text, magpie took it as success, and failover stopped.
-      const aborted = err?.name === "AbortError"
-      return openaiError(aborted ? 499 : 502, `OrcaTerm 连接中断：${err?.message ?? err}`)
+  try {
+    for (;;) {
+      let chunkRead
+      try {
+        chunkRead = await reader.read()
+      } catch (err) {
+        // Client abort / connection lost: answer with a real error status; it
+        // must not be dressed up as an answer. Earlier this returned 200 plus a
+        // "connection lost" text, magpie took it as success, and failover stopped.
+        const aborted = err?.name === "AbortError"
+        return openaiError(aborted ? 499 : 502, `OrcaTerm connection broke: ${err?.message ?? err}`)
+      }
+      const { done, value } = chunkRead
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const [lines, rest] = takeSseLines(buf)
+      buf = rest
+      for (const line of lines) absorb(line)
+      if (sawDone || upstreamError) {
+        buf = ""
+        break
+      }
     }
-    const { done, value } = chunkRead
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    const [lines, rest] = takeSseLines(buf)
-    buf = rest
-    for (const line of lines) absorb(line)
-    if (sawDone) {
-      buf = ""
-      break
-    }
+  } finally {
+    releaseReader(reader)
   }
   if (buf.trim() && !sawDone) absorb(buf)
 
   // upstream ended with an error (quota, rate limit, sign-in) → answer with the
   // real error status
   if (upstreamError) {
-    const m = errorStatus(upstreamError)
+    const m = errorStatus(upstreamError, pacer)
     // the upstream's own code is the useful thing here, not our error class:
     // pass the class as `type` and leave `code` to say what the upstream said.
     return openaiError(m.status, `OrcaTerm: ${upstreamError}`, upstreamError, m.type)
   }
 
   // The text is the assistant's action envelope, not plain prose: it is decoded
-  // by the same extractor the streaming path uses, so the two can't drift apart
-  // (they did once: the streaming path read this reply correctly and this one
-  // answered "empty reply" from the same bytes).
+  // by the same extractor the streaming path uses, so the two can't drift apart.
   const extractor = createAnswerExtractor()
-  let visible = extractor.push(content)
-  visible += extractor.finish()
+  const visible = extractor.push(content) + extractor.finish()
   // An empty text can't go up blank: the thinking is used first, then a note
   let finalContent = visible.trimEnd()
-  if (!finalContent || !finalContent.trim()) finalContent = reasoning
-  if (!finalContent) finalContent = "（OrcaTerm 返回了空回复）"
+  if (!finalContent && reasoning) finalContent = reasoning
+  if (!finalContent) finalContent = "(OrcaTerm returned an empty reply)"
   const message = { role: "assistant", content: finalContent }
   if (reasoning) message.reasoning_content = reasoning
   return new Response(
@@ -1706,12 +1790,10 @@ function openaiError(status, message, code = "upstream_error", type) {
 async function callAssistant({ auth, upstream, model, assistant, mode, signal }) {
   const bearer = bearerOf(auth)
   const skey = auth?.ticket?.skey
-  // A Bearer token needs no csrfCode — that is derived from a skey this account
-  // doesn't have.
+  // A Bearer token needs no csrfCode — that is derived from a skey this kind of
+  // account does not have.
   const csrf = bearer ? "" : csrfCode(skey)
-  const url =
-    `${ASSISTANT_BASE}/chat?name=${encodeURIComponent(assistant)}&mode=${mode}` +
-    (csrf ? `&csrfCode=${csrf}` : "")
+  const url = `${ASSISTANT_BASE}/chat?name=${encodeURIComponent(assistant)}&mode=${mode}${csrf ? `&csrfCode=${csrf}` : ""}`
   const body = structuredClone(upstream)
   body.user.setting.model = model
 
@@ -1771,87 +1853,6 @@ async function classifyUpstreamError(res) {
  *   - uin + skey and real             → SSE frames start coming right away
  * So "a non-auth error came back" means the credential is valid.
  */
-/**
- * 登录时立刻校验凭据，别让用户存进一个坏的。
- *
- * 判据（2026-10 实测）：
- *   - 只有 skey / 只有 p_uin+p_skey → NEED_UIN_AND_SKEY（cookie 根本没被接受）
- *   - uin + skey 但 skey 是假的     → VERIFY_SKEY_UIN_FAILED（进了校验层）
- *   - uin + skey 且真实             → 直接开始出 SSE 帧
- * 所以「拿到非鉴权类错误」就等于凭据是有效的。
- */
-async function verifyTicket(ticket, { timeoutMs = 20000 } = {}) {
-  const skey = ticket?.skey
-  if (!skey || !ticket?.uin) {
-    return { ok: false, reason: "uin 与 skey 必须成对提供" }
-  }
-  const body = {
-    conversationId: `cid-verify-${Date.now()}`,
-    user: { id: ticket.uin, setting: { model: MODEL_SPECS[0].id } },
-    input: { id: inputId(), content: "ping", files: [], historyMessages: [] },
-    stream: true,
-  }
-  let res
-  try {
-    res = await fetch(
-      `${ASSISTANT_BASE}/chat?name=${ASSISTANT.orcaterm}&mode=${MODE.react}&csrfCode=${csrfCode(skey)}`,
-      {
-        method: "POST",
-        headers: baseHeaders({ "x-seqid": body.input.id, cookie: cookieHeader({ ticket }) }),
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
-      },
-    )
-  } catch (err) {
-    // 网络不通不代表凭据有问题；放行，让真正请求时再报
-    return { ok: true, reason: `无法在线校验（${err?.message ?? err}），已跳过` }
-  }
-
-  const ctype = res.headers.get("content-type") ?? ""
-  if (ctype.includes("event-stream")) {
-    // 真的开始出帧了：凭据有效
-    try {
-      await res.body?.cancel?.()
-    } catch {
-      /* ignore */
-    }
-    return { ok: true, reason: "" }
-  }
-
-  let text = ""
-  try {
-    text = await res.text()
-  } catch {
-    /* ignore */
-  }
-  // 上游错误体有两种形状：{code, message, error:{name,message}} 与 {data:{Response:{Error:{Code}}}}
-  // 注意 error.name 只是 HTTP 状态文案（"Internal Server Error"），真正的错误码在 message 里
-  let code = ""
-  try {
-    const j = JSON.parse(text)
-    const parts = [
-      j?.message,
-      j?.error?.message,
-      j?.code,
-      j?.data?.Response?.Error?.Code,
-      j?.data?.Response?.Error?.Message,
-      j?.Response?.Error?.Code,
-    ].filter((v) => v !== undefined && v !== null && String(v).trim())
-    code = parts.join(" | ")
-  } catch {
-    code = text.slice(0, 200)
-  }
-  if (/NEED_UIN_AND_SKEY/i.test(code)) {
-    return { ok: false, reason: "上游没接受这组 cookie（需要 uin 与 skey 同时存在）" }
-  }
-  if (/VERIFY_SKEY_UIN_FAILED|VERIFY_LOGIN_FAILED|VERIFY_USER_FAILED/i.test(code)) {
-    return { ok: false, reason: "skey 已过期，或与这个 uin 不匹配" }
-  }
-  // 其它错误（限流、风控、5xx）说明凭据本身是通的
-  return { ok: true, reason: "" }
-}
-
-// ── 用量（cgi/api DescribeUserUsageStats） ────────────────────────────────
 async function capiRequest(auth, action, data = {}) {
   const t = auth?.ticket ?? {}
   const seq = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`
@@ -1912,8 +1913,7 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
    * (`generateConversationId`, module 72535): `cid-<uuid>` plus `-<assistant>`
    * for any assistant that isn't lighthouse, plus `-<mode>` for any mode that
    * isn't RE_ACT. This plugin always asks as orcaterm in RE_ACT, so no mode
-   * suffix. A made-up id is fine — upstream never checks it exists — but the
-   * shape is the client's, which is what it does check.
+   * suffix.
    */
   const sessionFor = (auth, sid) => {
     const fp = `${fingerprint(auth)}:${sid || "default"}`
@@ -1922,10 +1922,6 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
       if (sessions.size > 64) sessions.clear()
       s = {
         conversationId: `cid-${randomUUID()}-${ASSISTANT.orcaterm}`,
-        // the raw id the conversation was registered under, kept so a retry
-        // doesn't register it twice
-        rawId: "",
-        registered: false,
         userId: uid("u-"),
       }
       sessions.set(fp, s)
@@ -1934,55 +1930,23 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
   }
 
   /**
-   * Register the conversation before chatting, as the web client does
-   * (`addConversation` → POST /conversation, then send).
+   * There is deliberately no `POST /conversation` here.
    *
-   * This is what keeps the thread: with the conversation registered, upstream
-   * answers turn 2 from its own side (measured 2026-10-27: "我叫小明" then
-   * "我叫什么名字" → "小明", with no history sent at all). Without it every turn
-   * arrives as a first turn, and passing `historyMessages` instead is wrong
-   * twice over: upstream reads a history entry's kind from `type`, not `role`
-   * (the wrong shape fails inside upstream with "[type] is not a function"), and
-   * the text it is given comes back echoed into the answer.
+   * The web client registers a conversation once and lets upstream keep the
+   * thread. This plugin cannot do the same: magpie hands every request a fresh
+   * session id, so `sessionFor` mints a new conversation id per request, and
+   * registering each one filled the user's OrcaTerm history with an entry per
+   * request — visible to them, and pointless, because the id is never reused.
    *
-   * A failure here isn't fatal — the chat still works, it just won't carry
-   * context — so the error is left to the request itself.
+   * Context comes from the transcript in `input.input` instead (see
+   * `toUpstreamBody`), and upstream answers without a registered conversation:
+   * measured 2026-10-27, a chat with no `/conversation` call returns a normal
+   * answer, and a two-turn exchange still carries the name from turn 1 through
+   * the transcript.
    */
-  const registerConversation = async (auth, session, signal) => {
-    if (session.registered) return
-    if (!session.rawId) session.rawId = session.conversationId.replace(/^cid-/, "").replace(/-orcaterm$/, "")
-    const bearer = bearerOf(auth)
-    const csrf = bearer ? "" : csrfCode(auth?.ticket?.skey)
-    const url =
-      `${ASSISTANT_BASE}/conversation?name=${encodeURIComponent(ASSISTANT.orcaterm)}&mode=${MODE.react}` +
-      (csrf ? `&csrfCode=${csrf}` : "")
-    try {
-      await fetch(url, {
-        method: "POST",
-        headers: baseHeaders({
-          "x-seqid": uid("reg-"),
-          ...(bearer
-            ? { authorization: `Bearer ${bearer}`, "x-product": "orcaterm" }
-            : { cookie: cookieHeader(auth) }),
-        }),
-        body: JSON.stringify({
-          id: session.rawId,
-          title: "magpie",
-          ts: Date.now(),
-          customTitle: "",
-          aiTitle: "",
-          tags: [ASSISTANT.orcaterm],
-        }),
-        signal,
-      })
-      session.registered = true
-    } catch {
-      // unreachable upstream: the chat request will report it properly
-    }
-  }
 
   const modelsBlock = Object.fromEntries(
-    MODEL_SPECS.map((spec) => [
+    MODEL_SPECS.filter((spec) => spec.listed !== false).map((spec) => [
       spec.id,
       {
         name: spec.name,
@@ -2015,25 +1979,29 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
 
     auth: {
       provider: PROVIDER,
+      // Also declared on the hook, not only in package.json: siblings that get
+      // this right (codearts, zcode) do both, and this is what the README's
+      // "maxConcurrency is 1" describes. OrcaTerm's budget is per account and
+      // shared with its own desktop client, so one in flight.
+      maxConcurrency: 1,
 
       methods: [
         {
           type: "oauth",
-          label: "微信扫码登录（推荐 · 权限最小、两小时可续期）",
+          label: "WeChat QR sign-in (recommended: smallest credential, renewed every two hours)",
           /**
-           * 走 OrcaTerm 自己的微信 OAuth，而不是控制台会话 cookie。
+           * OrcaTerm's own WeChat OAuth, rather than the console session cookie.
            *
-           * 本机起一个一次性页面（默认 http://127.0.0.1:4080/login），页内用官方
-           * wxLogin.js 内嵌二维码，并设 `self_redirect: true`：扫码后微信的回跳落在
-           * 它自己创建的内层 iframe 里，OrcaTerm 的 bridge 页把 code postMessage 给
-           * 宿主页 —— 也就是我们的页面，于是插件直接收到 code。
+           * A one-off page is served locally (default http://127.0.0.1:4080/login)
+           * and embeds WeChat's qrconnect widget with `self_redirect: true`, so
+           * the return lands in the widget's own iframe and OrcaTerm's bridge page
+           * can postMessage the code back to our page. The user only scans; no
+           * URL has to be copied, which also closes the window where another tab
+           * could consume the state first.
            *
-           * 用户只需要扫码，不用复制任何链接，也就不存在「state 被别的窗口抢先
-           * 消费」的窗口期。
-           *
-           * 远程部署时插件监听在服务器回环地址，浏览器够不到：
-           *   ssh -L 4080:127.0.0.1:4080 <server>   然后打开上面的地址
-           * 端口/基址可用 ORCATERM_CAPTURE_PORT / ORCATERM_CAPTURE_BASE 覆盖。
+           * Behind a remote deploy the page listens on the server's loopback and
+           * the browser cannot reach it: `ssh -L 4080:127.0.0.1:4080 <server>`,
+           * then open the address. ORCATERM_CAPTURE_PORT / _HOST / _BASE override it.
            */
           async authorize() {
             let started
@@ -2042,7 +2010,7 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
             } catch (err) {
               return {
                 type: "failed",
-                error: `取微信登录配置失败：${err?.message ?? err}。可改用「手动粘贴 cookie」。`,
+                error: `Could not read the WeChat sign-in configuration: ${err?.message ?? err}. You can paste the cookie pair instead.`,
               }
             }
 
@@ -2051,27 +2019,39 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
               redirectUri: started.redirectUri,
               state: started.state,
             })
-            const pageUrl = await cap.ready
+            // `ready` rejects on a bind error, so a failure here becomes a failed
+            // sign-in with a reason instead of a hang.
+            let pageUrl
+            try {
+              pageUrl = await cap.ready
+            } catch (err) {
+              cap.close()
+              return {
+                type: "failed",
+                error: `Could not start the local sign-in page (${err?.code ?? err?.message ?? err}). You can paste the cookie pair instead.`,
+              }
+            }
 
             return {
               url: pageUrl,
               instructions:
-                "在打开的页面里用微信扫码，扫完会自动继续，不用复制任何链接。\n" +
-                "（若页面没自动打开，手动访问它；magpie 装在远端时先 ssh -L 4080:127.0.0.1:4080）",
+                "Scan the QR code in the page that opens; it carries on by itself, nothing to copy.\n" +
+                "(If the page did not open, visit it yourself; behind a remote install, ssh -L 4080:127.0.0.1:4080 first)",
               method: "auto",
-              // 注意：这里**不能**设 opened:true。那个字段的意思是「浏览器我已经
-              // 打开了」，而扫码方式的页面是本地起的服务、还没有任何浏览器打开它；
-              // 标成 true 会让 magpie 也不去打开，用户就什么也看不到。
-              // （拉起浏览器的那条路才设 opened:true——它真的自己开了一个窗口。）
-              // 仅供测试/调试用：扫码之前把本地接收页关掉。magpie 忽略未知字段
+              // No `opened: true` here on purpose: that field means "the plugin
+              // already opened a browser", and nothing has opened this page yet —
+              // setting it would stop magpie from opening it and leave the user
+              // with nothing on screen.
+              // Test/debug only: close the local page before a scan happens.
+              // magpie ignores unknown fields.
               __cap: cap,
               async callback() {
                 try {
                   const { code, state } = await cap.wait
                   const r = await exchangeCode({ code, state })
-                  // magpie 只有在结果里带 `refresh` 时才按 oauth 存盘（宿主 save()），
-                  // 而且只对 oauth 类型做自动续期。只给 key 会存成 api 类型——
-                  // 能用，但两小时后 token 到期就再也不续了。
+                  // magpie writes the credential only when a `refresh` is present
+                  // (host `save()`); with just a `key` it is stored as type "api"
+                  // and never renewed.
                   return {
                     type: "success",
                     access: r.accessToken,
@@ -2089,7 +2069,7 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
                 } catch (err) {
                   return {
                     type: "failed",
-                    error: `${err?.message ?? err}\n\n可改用「手动粘贴 cookie」。`,
+                    error: `${err?.message ?? err}\n\nYou can paste the cookie pair instead.`,
                   }
                 } finally {
                   cap.close()
@@ -2188,36 +2168,34 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
         },
         {
           type: "api",
-          label: "手动粘贴 cookie（uin=…; skey=…）",
+          label: "Paste the OrcaTerm cookie pair (uin=…; skey=…)",
           placeholder: "uin=o1234567890; skey=AbCdEf123456...",
         },
       ],
 
       /**
-       * 续期。微信扫码拿到的 accessToken 只有两小时，到期前必须换新的，否则
-       * 每次都要重新扫码。
+       * Renewal. A WeChat access token lives two hours; `OAuthRefreshToken` trades
+       * it for a fresh one of the same length, so a normal session never sees an
+       * expiry.
        *
-       * `OAuthRefreshToken` 用旧 token 换新 token，有效期同样两小时；
-       * magpie 会在到期前调用这里，所以正常使用不会感知到过期。
-       * 网络抖动不当作失效（返回 null 保留现有凭据），只有上游明确说过期才
-       * 抛 `signIn: "expired"` 让用户重新扫码。
+       * A console cookie has nothing to renew — it lasts until the user signs out
+       * of the console.
        */
       async refresh(auth) {
         const bearer = bearerOf(auth)
-        // The console-cookie path has no refresh: uin/skey lasts until the user
-        // signs out of the console, so there is nothing to renew.
         if (!bearer) return null
         try {
           const r = await refreshAccessToken(bearer)
           return {
             key: r.accessToken,
             access: r.accessToken,
+            refresh: r.accessToken,
             expires: r.expiresAt ?? undefined,
             metadata: { ...(auth?.metadata ?? {}), via: "wechat-qr", expires: r.expiresAt ?? undefined },
           }
         } catch (err) {
           if (/expired|invalid|失效|过期/i.test(String(err?.message ?? ""))) {
-            throw Object.assign(new Error(`OrcaTerm 登录已过期，请重新扫码：${err?.message ?? err}`), {
+            throw Object.assign(new Error(`OrcaTerm sign-in expired, scan again: ${err?.message ?? err}`), {
               signIn: "expired",
             })
           }
@@ -2233,14 +2211,14 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
       async loader(getAuth) {
         const auth = await getAuth()
         // Two ways to be signed in, decided by the shape of the stored key: a
-        // WeChat access token (JWT) is used as a Bearer credential, anything else
-        // is taken as the console cookie pair.
+        // WeChat access token (JWT) becomes a Bearer credential, anything else is
+        // taken as the console cookie pair.
         const bearer = bearerOf(auth)
         let bound
         if (bearer) {
           const claims = readTokenClaims(bearer)
           if (claims.exp && claims.exp * 1000 < Date.now()) {
-            throw Object.assign(new Error("OrcaTerm 微信登录已过期，请重新扫码"), { signIn: "expired" })
+            throw Object.assign(new Error("OrcaTerm sign-in expired, scan again"), { signIn: "expired" })
           }
           bound = { ...auth, bearer, ticket: null }
         } else {
@@ -2255,7 +2233,7 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
           // falling back to an address that is bound to 404.
           if (!ticket.uin) {
             throw Object.assign(
-              new Error("OrcaTerm 需要 uin 与 skey 成对：请在 F12 → Cookies 里把 uin 一起复制进来"),
+              new Error("OrcaTerm needs uin and skey together: copy uin alongside skey from F12 → Cookies"),
               { signIn: "expired" },
             )
           }
@@ -2278,7 +2256,7 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
             try {
               openaiBody = JSON.parse(bodyToText(init?.body) || "{}")
             } catch {
-              return openaiError(400, "请求体不是合法 JSON")
+              return openaiError(400, "The request body is not valid JSON")
             }
 
             const requested = openaiBody?.model
@@ -2287,18 +2265,19 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
 
             const upstream = toUpstreamBody(openaiBody, session)
 
-            // register the conversation first, or every turn lands as a first
-            // turn and the thread is lost
-            await registerConversation(bound, session, init?.signal)
+            // One pacer per account: the limit is per account upstream, and a
+            // shared one would let one account's cool-down stall the others.
+            const pacer = pacerFor(bound)
 
-            // Upstream allows ten chats a minute for the account and answers a
-            // burst with HTTP 200 + `{"code":429,…}` — not an SSE error. This
-            // plugin can't see other clients on the same account, so it paces
+            // Upstream allows about ten chats a minute per account and answers a
+            // burst with HTTP 200 + `{"code":429,…}` — not an SSE error. Other
+            // clients on the same account are invisible from here, so this paces
             // itself and leaves the rest of the budget alone.
-            await chatPacer.wait(init?.signal)
+            await pacer.wait(init?.signal)
 
             let res
             try {
+              if (init?.signal?.aborted) return openaiError(499, "the client cancelled the request")
               res = await callAssistant({
                 auth: bound,
                 upstream,
@@ -2307,78 +2286,91 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
                 mode: MODE.react,
                 signal: init?.signal,
               })
+              if (!res.ok) {
+                const info = await classifyUpstreamError(res)
+                // A limit reported by the status line rather than inside the body
+                // has to cool this account's pacer down as well, or the next
+                // request walks straight back into it.
+                if (info.status === 429 || res.status === 429) pacer.penalize()
+                // Only a confirmed sign-in problem answers 401 (magpie marks the
+                // account and stops dispatching on a 401 by default); quota gone /
+                // risk control / 5xx all answer 502, so magpie fails over instead
+                // of mistaking it for a new sign-in.
+                const status = info.signIn ? 401 : info.status >= 400 ? info.status : 502
+                const e = openaiError(status, `OrcaTerm: ${info.message}`, info.code)
+                if (info.signIn) e.headers.set("x-magpie-sign-in", info.signIn)
+                return e
+              }
+
+              // Upstream can answer 200 with something that isn't SSE at all: a
+              // JSON error, an HTML sign-in page, a plain-text risk-control
+              // notice. Anything whose content-type isn't event-stream is treated
+              // as an error — otherwise the SSE parser swallows it silently and
+              // the client sees an empty 200 answer, which is painful to diagnose.
+              const ctype = res.headers.get("content-type") ?? ""
+              const looksSSE = ctype.includes("event-stream")
+              const looksHTML = ctype.includes("html") || ctype.includes("xml")
+              if (!looksSSE) {
+                const text = await res.text()
+                let msg = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300)
+                let json = null
+                try {
+                  json = JSON.parse(text)
+                  msg = json?.error?.message ?? json?.message ?? msg
+                } catch {
+                  /* HTML / plain text: use the tag-stripped text */
+                }
+                // Classify by the upstream's own words — including the JSON body it
+                // sends for a rate limit, `{"code":429,"message":"Rate limit
+                // exceeded: chat-rpm"}`. Answering 502 for that made magpie treat a
+                // limit as a server fault: no account switch, and the pacer never
+                // cooled down, so the next request walked into the same wall.
+                const m = Number(json?.code) === 429
+                  ? errorStatus("rate limit", pacer)
+                  : errorStatus(`${json?.code ?? ""} ${msg} ${text}`, pacer)
+                const signIn = /NEED_UIN_AND_SKEY|VERIFY_SKEY_UIN_FAILED|VERIFY_LOGIN_FAILED|VERIFY_USER_FAILED/i.test(msg)
+                  ? "expired"
+                  : undefined
+                const status = signIn ? 401 : m.status
+                const e = openaiError(
+                  status,
+                  `OrcaTerm${looksHTML ? " returned a non-SSE response (a gateway or sign-in page may have intercepted it)" : ""}: ${msg || "empty response"}`,
+                  json?.code ?? "upstream_error",
+                  signIn ? undefined : m.type,
+                )
+                if (signIn) e.headers.set("x-magpie-sign-in", signIn)
+                return e
+              }
+              // a missing content-type needs its fallback too: no body is a
+              // straight error, not a silent empty answer
+              if (!res.body) return openaiError(502, "OrcaTerm returned an empty response")
+
+              // Upstream reports a failure as `data: [ERROR]: …` while the HTTP
+              // status stays 200. The head is read first to tell an answer from an
+              // error: quota gone has to be 429 so magpie switches accounts, and a
+              // dead sign-in has to be 401 to mark the account — otherwise the
+              // failure is taken for a normal answer.
+              const head = await peekAnswer(res.body)
+              if (head.verdict === "error") {
+                const code = errorCodeFromHead(head.text)
+                const m = errorStatus(code, pacer)
+                const e = openaiError(m.status, `OrcaTerm: ${code}`, code, m.type)
+                if (m.status === 401) e.headers.set("x-magpie-sign-in", "expired")
+                return e
+              }
+
+              // The stream head has already been read; splice it back in before
+              // handing the stream to the converters, or the opening text is lost
+              const body = replayBody(head)
+
+              if (stream) return upstreamToOpenAI(body, { model, pacer })
+              return await upstreamToJSON(body, { model, pacer })
             } catch (err) {
-              // an interruption (the client gave up) isn't an upstream fault
-              if (err?.name === "AbortError") return openaiError(499, "客户端已取消请求")
-              return openaiError(502, `连不上 OrcaTerm：${redactUrl(err?.message ?? err)}`)
-            }
-
-            if (!res.ok) {
-              const info = await classifyUpstreamError(res)
-              // Only a confirmed sign-in problem answers 401 (magpie marks the
-              // account and stops dispatching on a 401 by default); quota gone /
-              // risk control / 5xx all answer 502, so magpie fails over instead
-              // of mistaking it for a new sign-in.
-              const status = info.signIn ? 401 : info.status >= 400 ? info.status : 502
-              const e = openaiError(status, `OrcaTerm: ${info.message}`, info.code)
-              if (info.signIn) e.headers.set("x-magpie-sign-in", info.signIn)
-              return e
-            }
-
-            // Upstream can answer 200 with something that isn't SSE at all: a
-            // JSON error, an HTML sign-in page, a plain-text risk-control
-            // notice. Anything whose content-type isn't event-stream is treated
-            // as an error — otherwise the SSE parser swallows it silently and
-            // the client sees an empty 200 answer, which is painful to diagnose.
-            const ctype = res.headers.get("content-type") ?? ""
-            const looksSSE = ctype.includes("event-stream")
-            const looksHTML = ctype.includes("html") || ctype.includes("xml")
-            if (!looksSSE) {
-              const text = await res.text()
-              let msg = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300)
-              let signIn
-              try {
-                const j = JSON.parse(text)
-                msg = j?.error?.message ?? j?.message ?? msg
-              } catch {
-                /* HTML / plain text: use the tag-stripped text */
+              if (err?.name === "AbortError" || init?.signal?.aborted) {
+                return openaiError(499, "the client cancelled the request")
               }
-              if (/NEED_UIN_AND_SKEY|VERIFY_SKEY_UIN_FAILED|VERIFY_LOGIN_FAILED|VERIFY_USER_FAILED/i.test(msg)) {
-                signIn = "expired"
-              }
-              const e = openaiError(
-                signIn ? 401 : 502,
-                `OrcaTerm${looksHTML ? " 返回了非 SSE 响应（可能被网关/登录页拦截）" : ""}：${msg || "空响应"}`,
-                "upstream_error",
-              )
-              if (signIn) e.headers.set("x-magpie-sign-in", signIn)
-              return e
+              return openaiError(502, `cannot read OrcaTerm response: ${redactUrl(err?.message ?? err)}`)
             }
-            // a missing content-type needs its fallback too: no body is a
-            // straight error, not a silent empty answer
-            if (!res.body) return openaiError(502, "OrcaTerm 返回了空响应")
-
-            // Upstream reports a failure as `data: [ERROR]: …` while the HTTP
-            // status stays 200. The head is read first to tell an answer from an
-            // error: quota gone has to be 429 so magpie switches accounts, and a
-            // dead sign-in has to be 401 to mark the account — otherwise the
-            // failure is taken for a normal answer.
-            const head = await peekAnswer(res.body)
-            if (head.verdict === "error") {
-              const code = errorCodeFromHead(head.text)
-              const m = errorStatus(code)
-              const e = openaiError(m.status, `OrcaTerm: ${code}`, code, m.type)
-              if (m.status === 401) e.headers.set("x-magpie-sign-in", "expired")
-              return e
-            }
-
-            // The head has been read, so the body is locked: it must always go
-            // back through replayBody, even when the peek read nothing. Passing
-            // res.body on would throw "ReadableStream is locked" downstream.
-            const body = head.reader ? replayBody(head) : res.body
-
-            if (stream) return upstreamToOpenAI(body, { model })
-            return upstreamToJSON(body, { model })
           },
         }
       },
@@ -2386,15 +2378,15 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
       /** magpie's own hook: show OrcaTerm's Q&A quota on the account card */
       async usage(getAuth) {
         const auth = await getAuth()
-        // 微信扫码拿到的是一枚 accessToken，不是 uin/skey —— 额度接口只认控制台
-        // 会话，所以这种账号读不到配额。返回空数据而不是报错：账号本身是好的，
-        // 报「凭据缺少 uin」只会让人以为登录失败。
-        if (bearerOf(auth)) {
-          return { user: readTokenClaims(bearerOf(auth)).nickname || undefined, windows: [] }
-        }
+        // A WeChat scan yields an accessToken, not uin/skey — the quota endpoint
+        // only speaks the console session, so such an account has no quota to
+        // read. Return no windows rather than an error: the account is fine, and
+        // "credential is missing uin" would read as a failed sign-in.
+        const bearer = bearerOf(auth)
+        if (bearer) return { user: readTokenClaims(bearer).nickname || undefined, windows: [] }
         const ticket = parseTicket(auth?.key ?? "")
-        if (!ticket) return { error: "还没登录", windows: [] }
-        if (!ticket.uin) return { error: "凭据缺少 uin，请重新粘贴 uin 与 skey", windows: [] }
+        if (!ticket) return { error: "not signed in", windows: [] }
+        if (!ticket.uin) return { error: "the credential is missing uin; paste uin and skey again", windows: [] }
         const bound = { ...auth, ticket }
 
         // A throw in usage puts an error on the account card, so everything is
@@ -2408,9 +2400,9 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
           if (resp?.Error) {
             const code = resp.Error.Code ?? ""
             if (/VERIFY_SKEY_UIN_FAILED|VERIFY_USER_FAILED|VERIFY_LOGIN_FAILED|NOT_LOGIN/i.test(code)) {
-              return { error: `OrcaTerm 拒绝了登录（${code}），请重新登录`, windows: [], signIn: "expired" }
+              return { error: `OrcaTerm refused the sign-in (${code}); sign in again`, windows: [], signIn: "expired" }
             }
-            return { error: `OrcaTerm 读额度失败：${code || resp.Error.Message}`, windows: [] }
+            return { error: `OrcaTerm could not read the allowance: ${code || resp.Error.Message}`, windows: [] }
           }
 
           const stats = Array.isArray(resp?.usageStats) ? resp.usageStats : []
@@ -2424,12 +2416,12 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
             const used = Number(st.quotaUsed)
             if (!Number.isFinite(limit) || limit < 0) continue
             windows.push({
-              name: "AI 问答",
+              name: "AI Q&A",
               used: limit > 0 ? Math.min(999, Math.round((used / limit) * 100)) : 0,
               display: `${used} / ${limit}`,
               amount: used,
               limit,
-              unit: "次",
+              unit: "questions",
               ...(st.quotaEndDate ? { resetsAt: toIso(st.quotaEndDate) } : {}),
               ...(st.quotaStartDate && st.quotaEndDate
                 ? {
@@ -2457,7 +2449,7 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
               user,
               plan: resp?.roleType ? `OrcaTerm ${resp.roleType}` : undefined,
               windows: [],
-              error: "OrcaTerm 没有返回 AI 问答额度字段",
+              error: "OrcaTerm returned no AI question allowance field",
             }
           }
           return {
@@ -2466,7 +2458,7 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
             windows,
           }
         } catch (err) {
-          return { error: `读取额度失败：${redactUrl(err?.message ?? err)}`, windows: [] }
+          return { error: `could not read the allowance: ${redactUrl(err?.message ?? err)}`, windows: [] }
         }
       },
 
@@ -2479,11 +2471,9 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
     // account don't share context.
     //
     // When magpie passes no session id — it does not for every caller — the
-    // fallback must be steady too. `uid("s-")` here made a fresh id per request,
-    // so each turn opened a new conversation upstream and the thread was lost
-    // (measured through the gateway: turn 2 could not recall turn 1, while the
-    // same two turns went through when the request was made directly).
-    // One fixed key per account keeps those turns in one conversation.
+    // fallback has to be steady too: a fresh id per request opened a new
+    // conversation upstream every turn and the thread was lost, while the same
+    // turns went through when the plugin was driven directly.
     "chat.headers": async (input, output) => {
       if (input?.model?.providerID !== PROVIDER) return
       try {
@@ -2504,16 +2494,11 @@ function toIso(v) {
 
 // ---- test exit (magpie calls only exported functions as plugins; _internal is
 // an object, never called) ----------------------------------------------------
-// OpenCode v1 shape: magpie reads `server`, and exporting one function keeps the
-// module's other exports out of the plugin list.
-export default { id: "opencode-orcaterm-auth", server: OrcaTermAuthPlugin }
-
 // Everything the tests reach for, as the other packages do: nothing here is
 // part of the provider contract.
 export const _internal = {
   PROVIDER,
   MODEL_SPECS,
-  createPacer,
   ALIAS_TO_ID,
   ASSISTANT,
   ASSISTANT_BASE,
@@ -2521,6 +2506,15 @@ export const _internal = {
   WEB_TERMINAL,
   uid,
   inputId,
+  createPacer,
+  pacerFor,
+  createLocalCapture,
+  isEnvelope,
+  isActionEnvelope,
+  appendedEnvelopeAt,
+  unwrapAnswer,
+  stripTrailingEnvelope,
+  createAnswerExtractor,
   csrfCode,
   parseTicket,
   cookieHeader,
@@ -2532,9 +2526,6 @@ export const _internal = {
   takeSseLines,
   parseSseLine,
   fullToDelta,
-  unwrapAnswer,
-  stripTrailingEnvelope,
-  createAnswerExtractor,
   errorStatus,
   peekAnswer,
   classifyHead,
@@ -2551,3 +2542,6 @@ export const _internal = {
 }
 
 
+
+// Personal npm package also supports the OpenCode v1 server entry.
+export default { id: "opencode-orcaterm-auth", server: OrcaTermAuthPlugin }

@@ -2,7 +2,7 @@
 
 > ## 📌 建议只用 OrcaTerm 模型选择器里出现的那几个模型
 >
-> 插件按 id 能列出更多模型，但**只有下面这九个在 OrcaTerm 自己的模型选择器里能选**：
+> 插件只列出下面这九个 OrcaTerm 模型选择器中的模型；其他旧 id 仅保留兼容解析：
 > Hy4-preview、Hy3、Kimi-K3、GLM-5.3-Flash、GLM-5.3、GLM-5.2、DeepSeek-V4.1-Flash、
 > DeepSeek-V4-Flash、Deepseek-V4-Pro。
 >
@@ -48,6 +48,8 @@ agent ──OpenAI/Anthropic/Gemini 任意协议──▶ magpie 网关
 - **出**：上游是 SSE，正文在 `content`、思考在 `reasoningContent`；
   这里逐帧翻译成 `chat.completion.chunk`（`delta.content` / `delta.reasoning_content`），
   兼容上游「累计全文」与「纯增量」两种发法，最后补 `finish_reason`（不发 `usage` 帧）。
+  若回复以 JSON envelope 的形状开头，会等到回复结束后再判定，避免误删 JSON 示例之后的解释；
+  普通正文与思考内容继续流式输出。前导空白、换行与 JSON 围栏均可解包。
 
 ### 会连到哪些主机
 
@@ -269,6 +271,7 @@ node probe.mjs "uin=o123; skey=xxx"
 npm test                      # 两套一起跑（80 项）
 node test/selftest.mjs        # 32 项：主链路
 node test/edge.mjs            # 51 项：对抗性边界
+node --test test/audit.test.mjs # 21 项：审核回归
 ```
 
 `selftest.mjs` 覆盖：纯函数、body 转换、SSE 双向翻译、错误路径、钩子形状、
@@ -312,6 +315,7 @@ node test/edge.mjs            # 51 项：对抗性边界
 | `probe.mjs` | 真机探针，用来校准协议与用量字段 |
 | `test/selftest.mjs` | 主链路自测（34 项） |
 | `test/edge.mjs` | 对抗性边界测试（51 项） |
+| `test/audit.test.mjs` | 回调坏输入、envelope、流尾错误、429、连接清理与读取异常（21 项） |
 | `package.json` | `magpie.maxConcurrency` / `magpie.icon` / keywords（`maxConcurrency` 同时写在 auth 钩子上） |
 
 ## 9. 额度窗口只有「AI 问答」

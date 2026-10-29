@@ -743,7 +743,7 @@ await ok("F8 带 tool_calls / tool 结果的多轮 → 上游 input 非空且不
   const joined = [up.input.input, ...up.input.historyMessages.map((m) => m.content)].join("\n")
   assert.ok(joined.includes("get_weather"), "工具调用丢了")
   assert.ok(joined.includes("晴 30 度"), "工具结果丢了")
-  assert.ok(up.input.input.includes("工具结果"), "末轮工具结果应成为 input")
+  assert.ok(up.input.input.includes("[tool result"), "末轮工具结果应成为 input")
 })
 
 // ══════════════════════════════════════════════════════════════════════════

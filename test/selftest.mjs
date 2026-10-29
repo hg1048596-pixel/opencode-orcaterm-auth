@@ -98,13 +98,20 @@ const MOCK = `http://127.0.0.1:${port}`
 const realFetch = globalThis.fetch
 globalThis.fetch = (input, init) => {
   const url = typeof input === "string" ? input : input?.url ?? String(input)
+  if (url === "https://orcaterm.com/oauth/wechat/config") {
+    return Promise.resolve(new Response(JSON.stringify({ code: 0, data: {
+      appid: "audit", redirect_uri: "https://orcaterm.com/oauth/wechat/bridge",
+      state: "audit-state", scope: "snsapi_login",
+    } }), { headers: { "content-type": "application/json" } }))
+  }
   if (url.includes("lightai.cloud.tencent.com")) {
     return realFetch(url.replace("https://lightai.cloud.tencent.com", MOCK), init)
   }
   if (url.includes("api.orcaterm.cloud.tencent.com")) {
     return realFetch(url.replace("https://api.orcaterm.cloud.tencent.com", MOCK), init)
   }
-  return realFetch(input, init)
+  if (url.startsWith("http://127.0.0.1:")) return realFetch(input, init)
+  throw new Error(`Unexpected external request in test: ${url}`)
 }
 
 // ── 1. 纯函数 ───────────────────────────────────────────────────────────────
@@ -217,7 +224,7 @@ await ok("system 提到前缀，历史与末轮分离", () => {
     { conversationId: "cid-1", userId: "u-1" },
   )
   assert.equal(up.conversationId, "cid-1")
-  assert.ok(up.input.input.startsWith("[系统指令"))
+  assert.ok(up.input.input.startsWith("[system instructions"))
   assert.ok(up.input.input.endsWith("第二问"))
   // 网页端主聊天不发 historyMessages：会话登记后上下文由服务端按
   // conversationId 维护（实测第二轮仍能答出上一轮的名字）
@@ -246,7 +253,7 @@ await ok("tool 结果与 tool_calls 降级成文本轮次", () => {
   const joined = [up.input.input, ...up.input.historyMessages.map((m) => m.content)].join("\n")
   assert.ok(joined.includes("get_weather"), "工具调用要降级成文本")
   assert.ok(joined.includes("晴 30度"), "工具结果不能丢")
-  assert.ok(up.input.input.includes("工具结果"), "末轮工具结果应成为 input")
+  assert.ok(up.input.input.includes("[tool result"), "末轮工具结果应成为 input")
 })
 
 await ok("数组式 content 只取文本", () => {
@@ -265,7 +272,7 @@ await ok("数组式 content 只取文本", () => {
     { conversationId: "c", userId: "u" },
   )
   assert.ok(up.input.input.includes("看图"))
-  assert.ok(up.input.input.includes("[图片]"))
+  assert.ok(up.input.input.includes("[image]"))
 })
 
 // ── 3. loader().fetch 端到端 ────────────────────────────────────────────────
@@ -457,7 +464,7 @@ await ok("config 声明 openai-compatible 供应商与全部模型", async () =>
   await plugin.config(cfg)
   const p = cfg.provider.orcaterm
   assert.equal(p.npm, "@ai-sdk/openai-compatible")
-  assert.equal(Object.keys(p.models).length, _internal.MODEL_SPECS.length)
+  assert.equal(Object.keys(p.models).length, 9)
   for (const m of Object.values(p.models)) {
     assert.ok(m.limit.context > 0 && m.limit.output > 0)
     assert.equal(typeof m.tool_call, "boolean")
@@ -475,7 +482,7 @@ await ok("auth 钩子的必备字段齐全", () => {
   // 三条路：微信扫码（推荐）→ 拉起本机浏览器（已知问题）→ 手动粘贴 cookie
   assert.ok(Array.isArray(plugin.auth.methods) && plugin.auth.methods.length === 3, "应当有 3 个登录方式")
   assert.equal(plugin.auth.methods[0].type, "oauth")
-  assert.ok(plugin.auth.methods[0].label.includes("扫码"), "第一个应当是微信扫码")
+  assert.ok(/WeChat.*QR|扫码/.test(plugin.auth.methods[0].label), "第一个应当是微信扫码")
   assert.equal(plugin.auth.methods[2].type, "api")
   assert.equal(typeof plugin.auth.loader, "function")
   assert.equal(typeof plugin.auth.usage, "function")
