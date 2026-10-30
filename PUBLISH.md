@@ -30,7 +30,7 @@ npm view opencode-orcaterm-auth version dist.shasum
 
 - 个人仓库：<https://github.com/hg1048596-pixel/opencode-orcaterm-auth>，分支 `main`。
 - 原社区 PR：<https://github.com/magpie-community/plugins/pull/460>，已经合并。后续扫码、额度和账号身份修复来自 `hg1048596-pixel/plugins:fix/orcaterm-null-callback`。
-- 社区包名为 `@magpie-community/opencode-orcaterm-auth`。它由社区仓库合并后的发布流程管理，个人 npm 包的版本与它分别维护。
+- 社区包名为 `@magpie-community/opencode-orcaterm-auth`。该包尚未首次发布到 npm，trusted publishing 无法创建新包；此 PR 合并后，在 owner 完成首次发布之前，magpie 从社区 `dist` 分支安装 0.1.1。个人 npm 包的版本与它分别维护。
 
 ## 安装
 
