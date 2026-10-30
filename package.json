@@ -1,6 +1,6 @@
 {
   "name": "opencode-orcaterm-auth",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "把腾讯云 OrcaTerm（遨驰终端）AI 助手的额度反代成 OpenAI 兼容接口，供 magpie / OpenCode 作为供应商使用",
   "type": "module",
   "main": "./index.mjs",
@@ -43,7 +43,7 @@
   "scripts": {
     "probe": "node probe.mjs",
     "login": "node login.mjs",
-    "test": "node test/selftest.mjs && node test/edge.mjs && node --test test/audit.test.mjs",
+    "test": "node test/selftest.mjs && node test/edge.mjs && node --test test/audit.test.mjs test/usage.test.mjs",
     "test:selftest": "node test/selftest.mjs",
     "test:edge": "node test/edge.mjs"
   },

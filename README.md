@@ -57,7 +57,7 @@ agent ──OpenAI/Anthropic/Gemini 任意协议──▶ magpie 网关
 | --- | --- | --- |
 | `lightai.cloud.tencent.com` | 每次对话 | 凭据、消息正文 |
 | `api.orcaterm.cloud.tencent.com` | 读额度（仅 cookie 登录） | 凭据 |
-| `orcaterm.com` | 扫码登录、续期 token | 凭据、OAuth `code` |
+| `orcaterm.com` | 扫码登录、续期 token、OAuth 额度查询 | 凭据、OAuth `code` |
 | `res.wx.qq.com` | 扫码页面 | 无——只是加载微信的 `wxLogin.js` |
 | `open.weixin.qq.com` | 二维码 iframe | OrcaTerm 下发的 `appid` / `redirect_uri` / `state` |
 
@@ -316,6 +316,7 @@ node --test test/audit.test.mjs # 24 项：审核回归
 | `test/selftest.mjs` | 主链路自测（34 项） |
 | `test/edge.mjs` | 对抗性边界测试（51 项） |
 | `test/audit.test.mjs` | 回调坏输入和取消提示、envelope、流尾错误、429、连接清理与读取异常（24 项） |
+| `test/usage.test.mjs` | 两种凭据的额度、账号身份和认证错误处理（7 项） |
 | `package.json` | `magpie.maxConcurrency` / `magpie.icon` / keywords（`maxConcurrency` 同时写在 auth 钩子上） |
 
 ## 9. 额度窗口只有「AI 问答」
@@ -323,7 +324,7 @@ node --test test/audit.test.mjs # 24 项：审核回归
 上游 `DescribeUserBillingStatus` 还会返回 `session_share` / `secret` / `space`，
 这些与 AI 额度无关，插件只展示 `hunyuan_ai`（1000 次/月）。
 
-扫码登录的账号读不到配额（额度接口只认控制台会话），账号卡片上不显示额度，这不影响使用。
+扫码账号同样支持额度显示：插件按官方客户端的方式，把现有 OAuth token 作为 ot_session cookie 发送到 https://orcaterm.com/cgi/api 查询 AI 额度。控制台 cookie 账号继续使用原接口，无需为了显示额度粘贴控制台凭据。
 
 ## 10. 凭据安全
 
