@@ -34,6 +34,23 @@ npm view opencode-orcaterm-auth version dist.shasum
 
 ## 安装
 
+### GitHub Packages 镜像
+
+个人仓库的 Packages 使用 `@hg1048596-pixel/opencode-orcaterm-auth`，registry 为
+`https://npm.pkg.github.com`。工作流 `.github/workflows/publish-github-packages.yml`
+从 npm 下载已发布版本，只调整归档中 `package.json` 的包名、仓库关联和目标 registry；
+插件代码、微信登录实现及其他归档文件保持原样。主项目仍以无 scope 的包名发布到 npm。
+
+工作流使用仓库提供的 `GITHUB_TOKEN`，权限限定为 `contents: read` 和 `packages: write`。
+发布新版本时先确认该版本已在 npm 可下载，再推送 `v版本号` 标签；也可在 Actions 页面手动运行，
+指定已有的 npm 版本。已有 GitHub Packages 版本会跳过重复发布。
+
+GitHub Packages 首次发布默认私有，公开可见性在包设置中单独管理；即使公开，
+通过 npm 客户端安装也需要 GitHub 的包读取认证。参见
+[GitHub npm registry 文档](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry)。
+
+### npm
+
 ```powershell
 magpie plugin add opencode-orcaterm-auth@0.2.9
 magpie plugin login orcaterm
