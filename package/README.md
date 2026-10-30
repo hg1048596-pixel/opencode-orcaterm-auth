@@ -4,7 +4,7 @@
 
 | 文件 | 版本 | SHA1 |
 | --- | --- | --- |
-| `opencode-orcaterm-auth-0.2.9.tgz` | 0.2.9，账号身份、扫码及额度修复 | `1745e06a1ba489ae00edd52e1e83ce3d30eb914d` |
+| `opencode-orcaterm-auth-0.2.9.tgz` | 0.2.9，npm latest 已发布，已下载核对 | `1745e06a1ba489ae00edd52e1e83ce3d30eb914d` |
 | `opencode-orcaterm-auth-0.2.8.tgz` | 0.2.8，扫码与额度修复准备版 | `167d80c2837ccfb89aba3537fd78975866fdd04c` |
 | `opencode-orcaterm-auth-0.2.7.tgz` | 0.2.7，扫码修复准备版 | `b4d6876dedced0039b6fcac019c9bff50cfa8395` |
 | `opencode-orcaterm-auth-0.2.6.tgz` | 0.2.6，已发布 | `33a529d83627f995434cdaac8b3cfafd5b1075a6` |
