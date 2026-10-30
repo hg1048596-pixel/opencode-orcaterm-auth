@@ -2,6 +2,9 @@
 
 本目录归档用于 npm 发布的已验证产物，供离线核对和安装。发布状态以 npm 注册表为准。
 
+0.2.9 的修复已同步到社区 [PR #510](https://github.com/magpie-community/plugins/pull/510)。
+社区包 `@magpie-community/opencode-orcaterm-auth@0.1.1` 由社区合并后的发布流程管理，与个人 npm 包分别发布。
+
 | 文件 | 版本 | SHA1 |
 | --- | --- | --- |
 | `opencode-orcaterm-auth-0.2.9.tgz` | 0.2.9，npm latest 已发布，已下载核对 | `1745e06a1ba489ae00edd52e1e83ce3d30eb914d` |
