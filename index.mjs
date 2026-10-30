@@ -1975,6 +1975,17 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
     ]),
   )
 
+  async function identifyAccount(auth, bearer) {
+    const userId = readTokenClaims(bearer).userId
+    // The SDK writes only the account whose loader or usage hook is running.
+    if (userId && (!auth?.accountId || !auth?.uid) && client?.auth?.set) {
+      await client.auth.set({ path: { id: PROVIDER }, body: {
+        ...auth, accountId: auth?.accountId || userId,
+        uid: auth?.uid || userId, userId,
+      } })
+    }
+  }
+
   return {
     // ---- provider declaration -----------------------------------------------
     config: async (cfg) => {
@@ -2067,6 +2078,9 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
                     access: r.accessToken,
                     refresh: r.accessToken,
                     expires: r.expiresAt ?? Date.now() + 7200 * 1000,
+                    // magpie deduplicates re-sign-ins by accountId, not userId.
+                    accountId: r.userId,
+                    uid: r.userId,
                     userId: r.userId,
                     metadata: {
                       via: "wechat-qr",
@@ -2196,11 +2210,13 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
         if (!bearer) return null
         try {
           const r = await refreshAccessToken(bearer)
+          const userId = readTokenClaims(bearer).userId || auth?.userId || auth?.metadata?.userId
           return {
             key: r.accessToken,
             access: r.accessToken,
             refresh: r.accessToken,
             expires: r.expiresAt ?? undefined,
+            ...(userId ? { accountId: auth?.accountId || String(userId), uid: auth?.uid || String(userId), userId: String(userId) } : {}),
             metadata: { ...(auth?.metadata ?? {}), via: "wechat-qr", expires: r.expiresAt ?? undefined },
           }
         } catch (err) {
@@ -2227,6 +2243,7 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
         let bound
         if (bearer) {
           const claims = readTokenClaims(bearer)
+          await identifyAccount(auth, bearer)
           if (claims.exp && claims.exp * 1000 < Date.now()) {
             throw Object.assign(new Error("OrcaTerm sign-in expired, scan again"), { signIn: "expired" })
           }
@@ -2403,6 +2420,7 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
           // Measured (2026-10-27): the real quota is in DescribeUserBillingStatus'
           // usageStats[], not in DescribeUserUsageStats (whose feature only knows
           // hunyuan_ai/session_share/secret).
+          if (bearer) await identifyAccount(auth, bearer)
           const billing = await capiRequest(bound, "DescribeUserBillingStatus", {})
           const resp = billing?.data?.Response ?? billing?.Response
           if (resp?.Error) {

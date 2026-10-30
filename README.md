@@ -19,6 +19,9 @@ magpie plugin login orcaterm          # 选第 1 项：微信扫码登录（推�
 magpie provider test orcaterm
 ```
 
+扫码登录按 OrcaTerm 用户 ID 识别账号；同一账号更换令牌或昵称后重登，会更新原账号。
+旧登录记录在加载时补齐身份字段，已有重复卡片不会自动删除。
+
 模型名形如 `orcaterm/Deepseek-V4-Pro`、`orcaterm/GLM-5.3`、`orcaterm/Kimi-K3`，任何 agent 都能直接选
 （大小写与界面标签都能用）。
 

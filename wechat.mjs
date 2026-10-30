@@ -110,9 +110,11 @@ export async function exchangeCode({ code, state, base = OAUTH_BASE }) {
   }
   const d = body.data
   if (!d.accessToken) throw new WechatLoginError("INTERNAL_ERROR", "[exchange] no accessToken in the response")
+  const userId = String(d.userId ?? "").trim() || readTokenClaims(d.accessToken).userId.trim()
+  if (!userId) throw new WechatLoginError("INTERNAL_ERROR", "[exchange] no userId in the response or access token")
   const expiresIn = Number(d.expiresIn) || 0
   return {
-    userId: String(d.userId ?? ""),
+    userId,
     nickname: d.providerUsername ?? "",
     avatar: d.avatar ?? "",
     accessToken: d.accessToken,
