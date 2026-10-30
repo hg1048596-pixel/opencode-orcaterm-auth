@@ -316,10 +316,12 @@ export function createLocalCapture({ appid, redirectUri, state, timeoutMs = 3000
         } catch {
           /* ignore */
         }
+        // OrcaTerm's bridge uses null for missing URL parameters: successful
+        // scans carry error: null, and cancellations can carry code: null.
         if (!body || typeof body !== "object" || Array.isArray(body) ||
             typeof body.state !== "string" ||
-            (body.error !== undefined && typeof body.error !== "string") ||
-            (body.code !== undefined && typeof body.code !== "string") ||
+            (body.error != null && typeof body.error !== "string") ||
+            (body.code != null && typeof body.code !== "string") ||
             (typeof body.code !== "string" && !body.error)) {
           res.writeHead(400, { "content-type": "application/json" })
           res.end(JSON.stringify({ ok: false, error: "invalid callback body" }))

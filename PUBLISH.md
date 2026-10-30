@@ -1,6 +1,6 @@
 # 发布与同步
 
-当前修复版本：`opencode-orcaterm-auth@0.2.6`。
+当前修复版本：`opencode-orcaterm-auth@0.2.7`。
 
 个人 npm 包和社区 PR 共用请求转换、答案解析、错误分类、账号控速及微信 OAuth 实现。个人包另外保留 `login.mjs` 等手动工具及旧浏览器登录入口；社区包不包含启动浏览器的辅助脚本。
 
@@ -11,7 +11,7 @@ npm test
 npm pack --ignore-scripts
 ```
 
-测试共 107 项：34 项主链路、51 项边界、22 项审核回归。测试不使用真实腾讯账号，扫码配置用测试桩，网络只连接回环服务器。
+测试共 109 项：34 项主链路、51 项边界、24 项审核回归。测试不使用真实腾讯账号，扫码配置用测试桩，网络只连接回环服务器。
 
 打包后必须解包并检查入口可加载，特别确认包含 `wechat.mjs`。发布产物归档在 `package/`，其 SHA1 应与 npm 的 `dist.shasum` 一致。
 
@@ -34,7 +34,7 @@ npm view opencode-orcaterm-auth version dist.shasum
 ## 安装
 
 ```powershell
-magpie plugin add opencode-orcaterm-auth@0.2.6
+magpie plugin add opencode-orcaterm-auth@0.2.7
 magpie plugin login orcaterm
 ```
 

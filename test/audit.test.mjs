@@ -1,5 +1,6 @@
 import { test, afterEach } from "node:test"
 import assert from "node:assert/strict"
+import vm from "node:vm"
 import { OrcaTermAuthPlugin, _internal as i } from "../index.mjs"
 
 const realFetch = globalThis.fetch
@@ -182,6 +183,51 @@ test("callback preserves bridge errors without a code and still permits a later 
     assert.equal(res.status, 200)
     assert.deepEqual(await res.json(), { ok: false, error: "access_denied" })
     assert.equal((await (await send({ code: "C", state: "audit-state" })).json()).ok, true)
+    assert.deepEqual(await cap.wait, { code: "C", state: "audit-state" })
+  } finally { cap.close() }
+})
+
+test("official bridge success with error null passes through the login page", async () => {
+  const cap = i.createLocalCapture({ appid: "audit", redirectUri: "https://orcaterm.com/oauth/wechat/bridge", state: "audit-state", timeoutMs: 5000 })
+  try {
+    const url = await cap.ready
+    const html = await (await realFetch(url, { headers: { connection: "close" } })).text()
+    const script = /<script>\s*([\s\S]*?)<\/script>/.exec(html)?.[1]
+    assert.ok(script)
+    let listener
+    const elements = new Map(["wrap", "done"].map(id => [id, { style: {}, textContent: "" }]))
+    vm.runInNewContext(script, {
+      WxLogin: function () {}, URL, location: { href: url },
+      document: { getElementById: id => elements.get(id) },
+      window: { addEventListener(type, callback) { if (type === "message") listener = callback } },
+      fetch(target, init) {
+        return realFetch(target, { ...init, headers: { ...init.headers, origin: new URL(url).origin, connection: "close" } })
+      },
+    }, { timeout: 1000 })
+    // The public /oauth/wechat/bridge uses URLSearchParams.get(...) || null
+    // for code, state and error; successful scans therefore carry error: null.
+    await listener({ origin: "https://orcaterm.com", data: {
+      type: "wechat-oauth-callback", code: "C", state: "audit-state", error: null,
+    } })
+    assert.match(elements.get("done").textContent, /^Scanned/)
+    assert.deepEqual(await cap.wait, { code: "C", state: "audit-state" })
+  } finally { cap.close() }
+})
+
+test("official bridge cancellation with code null keeps the error message", async () => {
+  const cap = i.createLocalCapture({ appid: "audit", redirectUri: "https://orcaterm.com/oauth/wechat/bridge", state: "audit-state", timeoutMs: 5000 })
+  try {
+    const url = await cap.ready
+    const send = value => realFetch(new URL("/cb", url), {
+      method: "POST", headers: { "content-type": "application/json", origin: new URL(url).origin, connection: "close" }, body: JSON.stringify(value),
+    })
+    const error = await send({ code: null, state: "audit-state", error: "access_denied" })
+    assert.equal(error.status, 200)
+    assert.deepEqual(await error.json(), { ok: false, error: "access_denied" })
+    const missing = await send({ code: null, state: "audit-state", error: null })
+    assert.equal(missing.status, 400)
+    const success = await send({ code: "C", state: "audit-state", error: null })
+    assert.equal((await success.json()).ok, true)
     assert.deepEqual(await cap.wait, { code: "C", state: "audit-state" })
   } finally { cap.close() }
 })

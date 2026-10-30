@@ -271,7 +271,7 @@ node probe.mjs "uin=o123; skey=xxx"
 npm test                      # 两套一起跑（80 项）
 node test/selftest.mjs        # 32 项：主链路
 node test/edge.mjs            # 51 项：对抗性边界
-node --test test/audit.test.mjs # 22 项：审核回归
+node --test test/audit.test.mjs # 24 项：审核回归
 ```
 
 `selftest.mjs` 覆盖：纯函数、body 转换、SSE 双向翻译、错误路径、钩子形状、
@@ -315,7 +315,7 @@ node --test test/audit.test.mjs # 22 项：审核回归
 | `probe.mjs` | 真机探针，用来校准协议与用量字段 |
 | `test/selftest.mjs` | 主链路自测（34 项） |
 | `test/edge.mjs` | 对抗性边界测试（51 项） |
-| `test/audit.test.mjs` | 回调坏输入和取消提示、envelope、流尾错误、429、连接清理与读取异常（22 项） |
+| `test/audit.test.mjs` | 回调坏输入和取消提示、envelope、流尾错误、429、连接清理与读取异常（24 项） |
 | `package.json` | `magpie.maxConcurrency` / `magpie.icon` / keywords（`maxConcurrency` 同时写在 auth 钩子上） |
 
 ## 9. 额度窗口只有「AI 问答」
